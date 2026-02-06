@@ -440,6 +440,8 @@ def screen_help(stdscr):
             "- Ctrl+N: nova query (aba).",
             "- Ctrl+TAB: proxima query.",
             "- Ctrl+Shift+TAB: query anterior.",
+            "- Ctrl+X: fechar query atual.",
+            "- F8/F7: proxima/anterior (fallback).",
             "- Ctrl+C: copiar texto do editor.",
             "- Ctrl+V: colar no editor.",
             "- Home/End: inicio/fim da linha no editor.",
@@ -824,6 +826,10 @@ def panel_query_editor(stdscr, conn, y, x, h, w, initial_sql=""):
     def validator(ch):
         if ch == curses.KEY_DC:
             return curses.KEY_BACKSPACE
+        if ch in (curses.KEY_ENTER, 10, 13):
+            box.do_command(curses.ascii.SI)
+            box.do_command(curses.ascii.NL)
+            return 0
         if ch == 3:  # Ctrl+C
             text = box.gather().rstrip()
             if text:
@@ -965,11 +971,15 @@ def editor_edit(stdscr, y, x, h, w, initial_sql):
     txt_win.refresh()
     box = curses.textpad.Textbox(txt_win, insert_mode=True)
 
-    state = {"cancel": False, "execute": False, "tab": None, "switch_tab": None, "new_tab": False}
+    state = {"cancel": False, "execute": False, "tab": None, "switch_tab": None, "new_tab": False, "close_tab": False}
 
     def validator(ch):
         if ch == curses.KEY_DC:
             return curses.KEY_BACKSPACE
+        if ch in (curses.KEY_ENTER, 10, 13):
+            box.do_command(curses.ascii.SI)
+            box.do_command(curses.ascii.NL)
+            return 0
         if ch == 3:  # Ctrl+C
             text = box.gather().rstrip()
             if text:
@@ -993,10 +1003,19 @@ def editor_edit(stdscr, y, x, h, w, initial_sql):
         if ch == curses.ascii.SO:  # Ctrl+N
             state["new_tab"] = True
             return 7
+        if ch == curses.ascii.CAN:  # Ctrl+X
+            state["close_tab"] = True
+            return 7
         if ch in (curses.KEY_CTAB, 341):
             state["switch_tab"] = "next"
             return 7
         if ch in (curses.KEY_CATAB, 342):
+            state["switch_tab"] = "prev"
+            return 7
+        if ch == curses.KEY_F8:
+            state["switch_tab"] = "next"
+            return 7
+        if ch == curses.KEY_F7:
             state["switch_tab"] = "prev"
             return 7
         if ch == curses.KEY_F5:
@@ -1040,6 +1059,8 @@ def editor_edit(stdscr, y, x, h, w, initial_sql):
         return sql, "execute"
     if state["new_tab"]:
         return sql, "new_tab"
+    if state["close_tab"]:
+        return sql, "close_tab"
     if state["switch_tab"]:
         return sql, f"switch_tab_{state['switch_tab']}"
     if state["tab"]:
@@ -1254,7 +1275,7 @@ def screen_workspace(stdscr, conn, cfg, current):
                 safe_addstr(results_win, result_h - 2, 2, info[: right_w - 4])
 
             # Footer
-            footer = "ESC = Desconectar | R = Atualizar | TAB = Alternar foco | Shift+TAB = Foco anterior | Ctrl+N = Nova query | Ctrl+TAB = Trocar query | F6 = Salvar CSV | F1 = Ajuda"
+            footer = "ESC = Desconectar | R = Atualizar | TAB = Alternar foco | Shift+TAB = Foco anterior | Ctrl+N = Nova query | Ctrl+X = Fechar query | Ctrl+TAB = Trocar query | F6 = Salvar CSV | F1 = Ajuda"
             safe_addstr(stdscr, h - 1, 2, footer[: w - 4])
 
             stdscr.refresh()
@@ -1290,11 +1311,37 @@ def screen_workspace(stdscr, conn, cfg, current):
                 focus = "editor"
                 enter_edit_on_focus = True
                 continue
+            if ch == curses.ascii.CAN:  # Ctrl+X
+                if len(tabs) > 1:
+                    tabs.pop(tab_index)
+                    if tab_index >= len(tabs):
+                        tab_index = len(tabs) - 1
+                else:
+                    tabs[0]["text"] = ""
+                    tabs[0]["result"]["cols"] = None
+                    tabs[0]["result"]["rows"] = None
+                    tabs[0]["result"]["row_count"] = 0
+                    tabs[0]["result"]["col_count"] = 0
+                    tabs[0]["result"]["title"] = "Results"
+                    tabs[0]["result"]["msg"] = ""
+                    tabs[0]["result"]["error"] = ""
+                    tabs[0]["result"]["scroll"] = 0
+                    tabs[0]["result"]["scroll_x"] = 0
+                focus = "editor"
+                continue
             if ch in (curses.KEY_CTAB, 341):
                 tab_index = (tab_index + 1) % len(tabs)
                 focus = "editor"
                 continue
             if ch in (curses.KEY_CATAB, 342):
+                tab_index = (tab_index - 1) % len(tabs)
+                focus = "editor"
+                continue
+            if ch == curses.KEY_F8:
+                tab_index = (tab_index + 1) % len(tabs)
+                focus = "editor"
+                continue
+            if ch == curses.KEY_F7:
                 tab_index = (tab_index - 1) % len(tabs)
                 focus = "editor"
                 continue
@@ -1467,6 +1514,24 @@ def screen_workspace(stdscr, conn, cfg, current):
                         new_tab("")
                         focus = "editor"
                         enter_edit_on_focus = True
+                    elif action == "close_tab":
+                        if len(tabs) > 1:
+                            tabs.pop(tab_index)
+                            if tab_index >= len(tabs):
+                                tab_index = len(tabs) - 1
+                        else:
+                            tabs[0]["text"] = ""
+                            tabs[0]["result"]["cols"] = None
+                            tabs[0]["result"]["rows"] = None
+                            tabs[0]["result"]["row_count"] = 0
+                            tabs[0]["result"]["col_count"] = 0
+                            tabs[0]["result"]["title"] = "Results"
+                            tabs[0]["result"]["msg"] = ""
+                            tabs[0]["result"]["error"] = ""
+                            tabs[0]["result"]["scroll"] = 0
+                            tabs[0]["result"]["scroll_x"] = 0
+                        focus = "editor"
+                        enter_edit_on_focus = True
                     elif action == "switch_tab_next":
                         tab_index = (tab_index + 1) % len(tabs)
                         focus = "editor"
@@ -1479,6 +1544,24 @@ def screen_workspace(stdscr, conn, cfg, current):
                 if ch in (curses.KEY_F5, curses.KEY_F2):
                     if tab["text"].strip():
                         execute_and_set(tab["text"])
+                    continue
+                if ch == curses.ascii.CAN:  # Ctrl+X
+                    if len(tabs) > 1:
+                        tabs.pop(tab_index)
+                        if tab_index >= len(tabs):
+                            tab_index = len(tabs) - 1
+                    else:
+                        tabs[0]["text"] = ""
+                        tabs[0]["result"]["cols"] = None
+                        tabs[0]["result"]["rows"] = None
+                        tabs[0]["result"]["row_count"] = 0
+                        tabs[0]["result"]["col_count"] = 0
+                        tabs[0]["result"]["title"] = "Results"
+                        tabs[0]["result"]["msg"] = ""
+                        tabs[0]["result"]["error"] = ""
+                        tabs[0]["result"]["scroll"] = 0
+                        tabs[0]["result"]["scroll_x"] = 0
+                    focus = "editor"
                     continue
 
             elif focus == "results":
@@ -1650,6 +1733,10 @@ def screen_query(stdscr, conn, initial_sql=""):
     def validator(ch):
         if ch == curses.KEY_DC:
             return curses.KEY_BACKSPACE
+        if ch in (curses.KEY_ENTER, 10, 13):
+            box.do_command(curses.ascii.SI)
+            box.do_command(curses.ascii.NL)
+            return 0
         if ch == 3:  # Ctrl+C
             text = box.gather().rstrip()
             if text:

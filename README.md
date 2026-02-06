@@ -45,8 +45,10 @@ Para aparecer o icone personalizado na barra de aplicativos, abra pelo atalho cr
 - Setas: navegar (em Results use ←/→ para colunas).
 - Enter: editar query ou selecionar item.
 - Ctrl+N: nova query (aba).
+- Ctrl+X: fechar query atual.
 - Ctrl+TAB: proxima query.
 - Ctrl+Shift+TAB: query anterior.
+- F8/F7: proxima/anterior (fallback).
 - Ctrl+C: copiar texto do editor.
 - Ctrl+V: colar no editor.
 - Home: inicio da linha (editor).
