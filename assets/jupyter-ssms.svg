@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-label="Jupyter-SSMS">
+  <defs>
+    <linearGradient id="planet" x1="0" x2="1" y1="0" y2="1">
+      <stop offset="0%" stop-color="#f6d8a8"/>
+      <stop offset="100%" stop-color="#e28a3b"/>
+    </linearGradient>
+    <linearGradient id="band" x1="0" x2="1" y1="0" y2="0">
+      <stop offset="0%" stop-color="#f1c27a"/>
+      <stop offset="100%" stop-color="#c86d2c"/>
+    </linearGradient>
+  </defs>
+  <rect width="512" height="512" fill="none"/>
+  <circle cx="256" cy="256" r="190" fill="url(#planet)" stroke="#9b5b2a" stroke-width="10"/>
+  <path d="M100 210 C170 185 340 185 410 210" fill="none" stroke="url(#band)" stroke-width="26" stroke-linecap="round"/>
+  <path d="M90 265 C170 300 340 300 422 265" fill="none" stroke="url(#band)" stroke-width="22" stroke-linecap="round"/>
+  <path d="M120 315 C190 345 330 345 400 315" fill="none" stroke="url(#band)" stroke-width="18" stroke-linecap="round"/>
+  <ellipse cx="256" cy="338" rx="210" ry="48" fill="none" stroke="#c07a3a" stroke-width="10" opacity="0.85"/>
+  <ellipse cx="256" cy="338" rx="210" ry="48" fill="none" stroke="#f1c27a" stroke-width="4" opacity="0.6"/>
+</svg>
