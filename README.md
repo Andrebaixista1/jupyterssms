@@ -70,7 +70,11 @@ Para aparecer o icone personalizado na barra de aplicativos, abra pelo atalho cr
 - Modo avancado com espelhamento de banco/tabelas.
 
 ## Modo Avancado
-- Espelhar Banco: escolhe host origem e destino, seleciona database ou tabelas, copia dados com barra de progresso.
+- Espelhar Banco: tela com duas arvores (origem/destino) no mesmo layout do workspace.
+- Origem (esquerda): selecione tabelas com ESPACO.
+- Destino (direita): selecione o database com ENTER.
+- F2 conecta origem/destino conforme foco.
+- F5 inicia a copia com barra de progresso.
 
 ## Configuracoes e logs
 - Config: `~/.config/jupyter-ssms/config.json`

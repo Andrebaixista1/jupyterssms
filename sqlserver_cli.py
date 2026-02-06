@@ -357,6 +357,85 @@ def fetch_columns(conn, schema, table):
     cur.execute(sql, (schema, table))
     return cur.fetchall()
 
+def fetch_columns_detail(conn, schema, table):
+    sql = """
+    SELECT
+        c.name,
+        t.name AS data_type,
+        c.max_length,
+        c.precision,
+        c.scale,
+        c.is_nullable,
+        c.is_identity,
+        c.is_computed,
+        ic.seed_value,
+        ic.increment_value
+    FROM sys.columns c
+    JOIN sys.types t ON c.user_type_id = t.user_type_id
+    LEFT JOIN sys.identity_columns ic
+        ON ic.object_id = c.object_id AND ic.column_id = c.column_id
+    WHERE c.object_id = OBJECT_ID(?)
+    ORDER BY c.column_id
+    """
+    obj = f"{schema}.{table}"
+    cur = conn.cursor()
+    cur.execute(sql, (obj,))
+    return cur.fetchall()
+
+def table_exists(conn, schema, table):
+    sql = """
+    SELECT 1
+    FROM sys.tables t
+    JOIN sys.schemas s ON s.schema_id = t.schema_id
+    WHERE t.name = ? AND s.name = ?
+    """
+    cur = conn.cursor()
+    cur.execute(sql, (table, schema))
+    return cur.fetchone() is not None
+
+def schema_exists(conn, schema):
+    cur = conn.cursor()
+    cur.execute("SELECT 1 FROM sys.schemas WHERE name = ?", (schema,))
+    return cur.fetchone() is not None
+
+def ensure_schema(conn, schema):
+    if schema_exists(conn, schema):
+        return
+    conn.execute(f"CREATE SCHEMA [{schema}]")
+
+def build_column_type(col):
+    name, data_type, max_length, precision, scale, is_nullable, is_identity, is_computed, seed, inc = col
+    dt = data_type.lower()
+    type_part = dt
+    if dt in ("varchar", "char", "varbinary", "binary"):
+        size = "MAX" if max_length == -1 else str(max_length)
+        type_part = f"{dt}({size})"
+    elif dt in ("nvarchar", "nchar"):
+        size = "MAX" if max_length == -1 else str(max_length // 2)
+        type_part = f"{dt}({size})"
+    elif dt in ("decimal", "numeric"):
+        type_part = f"{dt}({precision},{scale})"
+    elif dt in ("datetime2", "datetimeoffset", "time"):
+        type_part = f"{dt}({scale})"
+    if is_identity:
+        seed_val = int(seed) if seed is not None else 1
+        inc_val = int(inc) if inc is not None else 1
+        type_part += f" IDENTITY({seed_val},{inc_val})"
+    null_part = "NULL" if is_nullable else "NOT NULL"
+    return f"[{name}] {type_part} {null_part}"
+
+def create_table_from_columns(conn, schema, table, columns):
+    ensure_schema(conn, schema)
+    col_defs = []
+    for col in columns:
+        if col[7]:  # is_computed
+            continue
+        col_defs.append(build_column_type(col))
+    if not col_defs:
+        return False
+    ddl = f"CREATE TABLE {build_table_ref_full(schema, table)} (\n  " + ",\n  ".join(col_defs) + "\n)"
+    conn.execute(ddl)
+    return True
 
 def run_query(conn, sql):
     cur = conn.cursor()
@@ -549,6 +628,13 @@ def screen_help(stdscr):
             "- Ctrl+V: colar no editor.",
             "- Home/End: inicio/fim da linha no editor.",
             "- F5: executar query.",
+            "",
+            "Modo Avancado (Espelhar Banco):",
+            "- TAB: alterna foco Origem/Destino.",
+            "- F2: conectar origem/destino (conforme foco).",
+            "- Enter em DB (Destino): define DB destino.",
+            "- Espaco em Tabela (Origem): seleciona tabela.",
+            "- F5: iniciar espelhamento.",
             "- F6: exportar resultados para CSV (separador ';').",
             "- Ao salvar: abre o gerenciador de arquivos (se disponivel).",
             "- R: atualizar listas.",
@@ -1026,15 +1112,23 @@ def build_table_ref(schema, table, db=None, include_db=False):
         return f"[{table}]"
     return f"[{schema}].[{table}]"
 
+def build_table_ref_full(schema, table, db=None, include_db=False):
+    if include_db and db:
+        return f"[{db}].[{schema}].[{table}]"
+    return f"[{schema}].[{table}]"
+
 def split_table_name(name):
     if "." in name:
         return name.split(".", 1)
     return "dbo", name
 
-def build_insert_sql(schema, table, columns):
+def build_insert_sql(schema, table, columns, param_wrappers=None):
     cols = ", ".join(f"[{c}]" for c in columns)
-    params = ", ".join(["?"] * len(columns))
-    return f"INSERT INTO {build_table_ref(schema, table)} ({cols}) VALUES ({params})"
+    if param_wrappers:
+        params = ", ".join(param_wrappers)
+    else:
+        params = ", ".join(["?"] * len(columns))
+    return f"INSERT INTO {build_table_ref_full(schema, table)} ({cols}) VALUES ({params})"
 
 def edit_text_multiline(stdscr, win, initial_text, action_keys=None, help_callback=None):
     maxy, maxx = win.getmaxyx()
@@ -1848,6 +1942,72 @@ def screen_confirm(stdscr, title, message):
         if ch in (curses.KEY_ENTER, 10, 13):
             return True
 
+def draw_advanced_layout(stdscr, state, progress=None):
+    stdscr.clear()
+    draw_header(stdscr, f"Jupyter-SSMS {VERSION} - Modo Avançado")
+    h, w = stdscr.getmaxyx()
+    if h < 20 or w < 80:
+        screen_message(stdscr, "Erro", "Terminal muito pequeno. Use ao menos 80x20.")
+        return
+    top = 2
+    toolbar = "F5 Iniciar | O=Origem | D=Destino | B=DBs | T=Tabelas | M=Modo | ESC Voltar"
+    safe_addstr(stdscr, top, 2, toolbar[: w - 4])
+
+    left_w = max(26, min(40, w // 3))
+    content_top = top + 1
+    content_bottom = h - 2
+    content_h = max(6, content_bottom - content_top)
+
+    right_x = left_w + 1
+    right_w = max(10, w - right_x - 1)
+    editor_h = max(6, content_h // 2)
+    result_h = max(4, content_h - editor_h - 1)
+
+    for y in range(content_top, content_top + content_h):
+        safe_addstr(stdscr, y, left_w, "|")
+
+    # Left panel
+    left_win = panel_window(stdscr, content_top, 1, content_h, left_w, "Ações", focused=True)
+    safe_addstr(left_win, 1, 2, "Espelhar Banco")
+
+    # Right top - config
+    cfg_win = panel_window(stdscr, content_top, right_x, editor_h, right_w, "Espelho")
+    lines = [
+        f"Origem:  {state.get('origin_label','-')}",
+        f"Destino: {state.get('dest_label','-')}",
+        f"DB Origem:  {state.get('origin_db','-')}",
+        f"DB Destino: {state.get('dest_db','-')}",
+        f"Modo: {state.get('mode','Database inteiro')}",
+        f"Tabelas: {state.get('tables_label','-')}",
+        "",
+        "Atalhos: O=Origem  D=Destino  B=DBs",
+        "         M=Modo    T=Tabelas  F5=Iniciar",
+    ]
+    max_lines = editor_h - 2
+    for i, line in enumerate(lines[:max_lines]):
+        safe_addstr(cfg_win, 1 + i, 2, line[: right_w - 4])
+
+    # Right bottom - progress
+    prog_win = panel_window(stdscr, content_top + editor_h + 1, right_x, result_h, right_w, "Progresso")
+    if progress:
+        safe_addstr(prog_win, 1, 2, "NÃO FECHAR O APP ATÉ FINALIZAR")
+        safe_addstr(prog_win, 2, 2, f"Tabela {progress['idx']}/{progress['total']}: {progress['table']}"[: right_w - 4])
+        total = progress["rows_total"]
+        copied = progress["rows_copied"]
+        percent = int((copied / total) * 100) if total else 0
+        bar_w = max(10, right_w - 6)
+        filled = int((percent / 100) * bar_w)
+        bar = "[" + "#" * filled + "-" * (bar_w - filled) + "]"
+        safe_addstr(prog_win, 4, 2, bar[: right_w - 4])
+        safe_addstr(prog_win, 5, 2, f"{copied}/{total} linhas ({percent}%)"[: right_w - 4])
+    else:
+        safe_addstr(prog_win, 1, 2, "Sem progresso ainda.")
+
+    stdscr.refresh()
+    left_win.refresh()
+    cfg_win.refresh()
+    prog_win.refresh()
+
 def render_progress(stdscr, title, origin_label, dest_label, table_name, table_idx, table_total, copied, total):
     stdscr.clear()
     draw_header(stdscr, title)
@@ -1867,7 +2027,7 @@ def render_progress(stdscr, title, origin_label, dest_label, table_name, table_i
     safe_addstr(stdscr, 10, 2, f"{copied}/{total} linhas ({percent}%)"[: w - 4])
     stdscr.refresh()
 
-def mirror_tables(stdscr, origin_conn, dest_conn, origin_db, dest_db, tables, origin_label, dest_label):
+def mirror_tables(stdscr, origin_conn, dest_conn, origin_db, dest_db, tables, origin_label, dest_label, progress_cb=None):
     try:
         origin_conn.execute(f"USE [{origin_db}]")
         dest_conn.execute(f"USE [{dest_db}]")
@@ -1879,15 +2039,36 @@ def mirror_tables(stdscr, origin_conn, dest_conn, origin_db, dest_db, tables, or
     for idx, t in enumerate(tables, start=1):
         schema, table = split_table_name(t)
         try:
-            cols = fetch_columns(origin_conn, schema, table)
-            col_names = [c[0] for c in cols]
+            cols = fetch_columns_detail(origin_conn, schema, table)
+            col_names = [c[0] for c in cols if not c[7]]
             if not col_names:
                 continue
-            select_cols = ", ".join(f"[{c}]" for c in col_names)
-            select_sql = f"SELECT {select_cols} FROM {build_table_ref(schema, table)}"
-            insert_sql = build_insert_sql(schema, table, col_names)
+            select_exprs = []
+            param_wrappers = []
+            for col in cols:
+                name, data_type, *_ = col
+                if col[7]:
+                    continue
+                dt = (data_type or "").lower()
+                if dt == "sql_variant":
+                    select_exprs.append(f"CONVERT(NVARCHAR(MAX), [{name}]) AS [{name}]")
+                    param_wrappers.append("CONVERT(sql_variant, ?)")
+                elif dt == "xml":
+                    select_exprs.append(f"CONVERT(NVARCHAR(MAX), [{name}]) AS [{name}]")
+                    param_wrappers.append("CONVERT(xml, ?)")
+                else:
+                    select_exprs.append(f"[{name}]")
+                    param_wrappers.append("?")
+            select_cols = ", ".join(select_exprs)
+            select_sql = f"SELECT {select_cols} FROM {build_table_ref_full(schema, table)}"
+            if not table_exists(dest_conn, schema, table):
+                created = create_table_from_columns(dest_conn, schema, table, cols)
+                if not created:
+                    screen_message(stdscr, "Erro", f"{schema}.{table}\nFalha ao criar tabela no destino.")
+                    return False
+            insert_sql = build_insert_sql(schema, table, col_names, param_wrappers)
             try:
-                total = origin_conn.execute(f"SELECT COUNT(*) FROM {build_table_ref(schema, table)}").fetchone()[0]
+                total = origin_conn.execute(f"SELECT COUNT(*) FROM {build_table_ref_full(schema, table)}").fetchone()[0]
             except Exception:
                 total = 0
             copied = 0
@@ -1898,43 +2079,203 @@ def mirror_tables(stdscr, origin_conn, dest_conn, origin_db, dest_db, tables, or
                 dest_cur.fast_executemany = True
             except Exception:
                 pass
-            render_progress(stdscr, "Modo Avançado - Espelhar Banco", origin_label, dest_label, t, idx, total_tables, copied, total)
+            has_identity = any(c[6] for c in cols if not c[7])
+            if has_identity:
+                dest_conn.execute(f"SET IDENTITY_INSERT {build_table_ref_full(schema, table)} ON")
+            if progress_cb:
+                progress_cb(t, idx, total_tables, copied, total)
+            else:
+                render_progress(stdscr, "Modo Avançado - Espelhar Banco", origin_label, dest_label, t, idx, total_tables, copied, total)
             while True:
                 rows = cur.fetchmany(batch_size)
                 if not rows:
                     break
                 dest_cur.executemany(insert_sql, rows)
                 copied += len(rows)
-                render_progress(stdscr, "Modo Avançado - Espelhar Banco", origin_label, dest_label, t, idx, total_tables, copied, total)
+                if progress_cb:
+                    progress_cb(t, idx, total_tables, copied, total)
+                else:
+                    render_progress(stdscr, "Modo Avançado - Espelhar Banco", origin_label, dest_label, t, idx, total_tables, copied, total)
+            if has_identity:
+                dest_conn.execute(f"SET IDENTITY_INSERT {build_table_ref_full(schema, table)} OFF")
         except Exception as e:
             screen_message(stdscr, "Erro", f"{t}\n{e}")
             return False
     return True
 
 def screen_advanced(stdscr, cfg, current, conn):
+    origin_conn = conn
+    origin_label = f"{current.get('user','')}@{current.get('host','')}:{current.get('port','')}"
+    origin_current_db = current.get("database") or "master"
+    dest_conn = None
+    dest_label = "Sem conexao"
+    dest_current_db = "master"
+    origin_dbs = []
+    dest_dbs = []
+    origin_expanded = set()
+    dest_expanded = set()
+    origin_tables_cache = {}
+    dest_tables_cache = {}
+    origin_columns_cache = {}
+    dest_columns_cache = {}
+    origin_expanded_tables = set()
+    dest_expanded_tables = set()
+    origin_idx = 0
+    dest_idx = 0
+    focus = "origin"
+    selected_tables = set()  # (db, table)
+    selected_origin_db = None
+    selected_dest_db = None
+
+    def reset_origin_state():
+        nonlocal origin_dbs, origin_expanded, origin_tables_cache, origin_columns_cache, origin_expanded_tables, origin_idx
+        origin_dbs = []
+        origin_expanded = set()
+        origin_tables_cache = {}
+        origin_columns_cache = {}
+        origin_expanded_tables = set()
+        origin_idx = 0
+
+    def reset_dest_state():
+        nonlocal dest_dbs, dest_expanded, dest_tables_cache, dest_columns_cache, dest_expanded_tables, dest_idx
+        dest_dbs = []
+        dest_expanded = set()
+        dest_tables_cache = {}
+        dest_columns_cache = {}
+        dest_expanded_tables = set()
+        dest_idx = 0
+
+    progress = None
+
     while True:
-        choice = screen_menu(stdscr, "Modo Avançado", ["Espelhar Banco", "Voltar"])
-        if choice != "Espelhar Banco":
+        if origin_conn and not origin_dbs:
+            try:
+                origin_dbs = fetch_databases(origin_conn)
+            except Exception as e:
+                screen_message(stdscr, "Erro", str(e))
+                return
+        if dest_conn and not dest_dbs:
+            try:
+                dest_dbs = fetch_databases(dest_conn)
+            except Exception as e:
+                screen_message(stdscr, "Erro", str(e))
+                return
+
+        stdscr.clear()
+        draw_header(stdscr, f"Jupyter-SSMS {VERSION} - Modo Avançado (Espelhar)")
+        h, w = stdscr.getmaxyx()
+        if h < 20 or w < 80:
+            screen_message(stdscr, "Erro", "Terminal muito pequeno. Use ao menos 80x20.")
             return
+        top = 2
+        toolbar = "F2 Conectar | TAB Alternar foco | F5 Iniciar | ESPACO Selecionar | ESC Voltar"
+        safe_addstr(stdscr, top, 2, toolbar[: w - 4])
 
-        origin_choice = screen_menu(
-            stdscr,
-            "Espelhar Banco - Origem",
-            [
-                f"Usar conexao atual ({current.get('user','')}@{current.get('host','')}:{current.get('port','')}/{current.get('database','')})",
-                "Outra conexao de origem",
-                "Voltar",
-            ],
-        )
-        if origin_choice is None or origin_choice == "Voltar":
+        content_top = top + 1
+        content_bottom = h - 2
+        content_h = max(6, content_bottom - content_top)
+        progress_h = max(4, min(8, content_h // 3))
+        tree_h = content_h - progress_h - 1
+
+        left_w = (w - 3) // 2
+        right_x = left_w + 2
+        right_w = w - right_x - 1
+
+        # separators
+        for y in range(content_top, content_top + tree_h):
+            safe_addstr(stdscr, y, left_w + 1, "|")
+
+        # Left: origem
+        origin_win = panel_window(stdscr, content_top, 1, tree_h, left_w, f"Origem: {origin_label}", focused=(focus == "origin"))
+        origin_items = build_tree_items(origin_dbs, origin_expanded, origin_tables_cache, origin_expanded_tables, origin_columns_cache)
+        if origin_idx >= len(origin_items):
+            origin_idx = max(0, len(origin_items) - 1)
+        max_lines = tree_h - 2
+        start = 0
+        if origin_idx >= max_lines:
+            start = origin_idx - max_lines + 1
+        for i, item in enumerate(origin_items[start : start + max_lines]):
+            idx = start + i
+            depth = item.get("depth", 0)
+            prefix = "   "
+            if item["type"] in ("db", "table"):
+                prefix = "[-]" if item.get("expanded") else "[+]"
+            elif item["type"] == "column":
+                prefix = " - "
+            marker = ""
+            if item["type"] == "table":
+                key = (item["db"], item["table"])
+                marker = "[x]" if key in selected_tables else "[ ]"
+            if item["type"] == "db" and selected_origin_db == item.get("db"):
+                marker = "=>"
+            label = f"{'  ' * depth}{prefix} {marker} {item['label']}".strip()
+            attr = curses.A_REVERSE if (focus == "origin" and idx == origin_idx) else 0
+            safe_addstr(origin_win, 1 + i, 2, label[: left_w - 4], attr)
+
+        # Right: destino
+        dest_title = f"Destino: {dest_label}"
+        if selected_dest_db:
+            dest_title += f" / {selected_dest_db}"
+        dest_win = panel_window(stdscr, content_top, right_x, tree_h, right_w, dest_title, focused=(focus == "dest"))
+        if dest_conn:
+            dest_items = build_tree_items(dest_dbs, dest_expanded, dest_tables_cache, dest_expanded_tables, dest_columns_cache)
+            if dest_idx >= len(dest_items):
+                dest_idx = max(0, len(dest_items) - 1)
+            max_lines = tree_h - 2
+            start = 0
+            if dest_idx >= max_lines:
+                start = dest_idx - max_lines + 1
+            for i, item in enumerate(dest_items[start : start + max_lines]):
+                idx = start + i
+                depth = item.get("depth", 0)
+                prefix = "   "
+                if item["type"] in ("db", "table"):
+                    prefix = "[-]" if item.get("expanded") else "[+]"
+                elif item["type"] == "column":
+                    prefix = " - "
+                marker = ""
+                if item["type"] == "db" and selected_dest_db == item.get("db"):
+                    marker = "=>"
+                label = f"{'  ' * depth}{prefix} {marker} {item['label']}".strip()
+                attr = curses.A_REVERSE if (focus == "dest" and idx == dest_idx) else 0
+                safe_addstr(dest_win, 1 + i, 2, label[: right_w - 4], attr)
+        else:
+            safe_addstr(dest_win, 1, 2, "Sem conexao. F2 para conectar.")
+
+        # Bottom progress
+        prog_win = panel_window(stdscr, content_top + tree_h + 1, 1, progress_h, w - 2, "Progresso")
+        if progress:
+            safe_addstr(prog_win, 1, 2, "NÃO FECHAR O APP ATÉ FINALIZAR")
+            safe_addstr(prog_win, 2, 2, f"Tabela {progress['idx']}/{progress['total']}: {progress['table']}"[: w - 4])
+            total = progress["rows_total"]
+            copied = progress["rows_copied"]
+            percent = int((copied / total) * 100) if total else 0
+            bar_w = max(10, w - 6)
+            filled = int((percent / 100) * bar_w)
+            bar = "[" + "#" * filled + "-" * (bar_w - filled) + "]"
+            safe_addstr(prog_win, 3, 2, bar[: w - 4])
+            safe_addstr(prog_win, 4, 2, f"{copied}/{total} linhas ({percent}%)"[: w - 4])
+        else:
+            safe_addstr(prog_win, 1, 2, "Sem progresso.")
+            safe_addstr(prog_win, 2, 2, f"Tabelas selecionadas: {len(selected_tables)}"[: w - 4])
+
+        stdscr.refresh()
+        origin_win.refresh()
+        dest_win.refresh()
+        prog_win.refresh()
+
+        ch = stdscr.getch()
+        if ch in (27,):
+            if dest_conn:
+                try:
+                    dest_conn.close()
+                except Exception:
+                    pass
+            return
+        if ch in (9, curses.KEY_BTAB, 353):
+            focus = "dest" if focus == "origin" else "origin"
             continue
-
-        origin_conn = conn
-        origin_label = f"{current.get('user','')}@{current.get('host','')}:{current.get('port','')}"
-        origin_db_default = current.get("database") or "master"
-        close_origin = False
-
-        if origin_choice.startswith("Outra"):
+        if ch == curses.KEY_F2:
             tmp_current = {
                 "name": "",
                 "host": "",
@@ -1948,165 +2289,192 @@ def screen_advanced(stdscr, cfg, current, conn):
                 continue
             conn_cfg = dict(cfg2)
             conn_cfg.update(cur2)
-            origin_conn, err = connect_db(conn_cfg, pwd2)
+            new_conn, err = connect_db(conn_cfg, pwd2)
             if err:
                 screen_message(stdscr, "Erro", err)
                 continue
-            origin_label = f"{cur2.get('user','')}@{cur2.get('host','')}:{cur2.get('port','')}"
-            origin_db_default = cur2.get("database") or "master"
-            close_origin = True
-
-        tmp_current = {
-            "name": "",
-            "host": "",
-            "port": cfg.get("port", "1433") or "1433",
-            "user": "",
-            "database": "master",
-            "driver": cfg.get("driver", "ODBC Driver 18 for SQL Server"),
-        }
-        cfg3, cur3, pwd3 = screen_connect(stdscr, cfg, tmp_current, "")
-        if cfg3 is None:
-            if close_origin:
-                try:
-                    origin_conn.close()
-                except Exception:
-                    pass
-            continue
-        conn_cfg = dict(cfg3)
-        conn_cfg.update(cur3)
-        dest_conn, err = connect_db(conn_cfg, pwd3)
-        if err:
-            if close_origin:
-                try:
-                    origin_conn.close()
-                except Exception:
-                    pass
-            screen_message(stdscr, "Erro", err)
-            continue
-        dest_label = f"{cur3.get('user','')}@{cur3.get('host','')}:{cur3.get('port','')}"
-
-        try:
-            origin_dbs = fetch_databases(origin_conn)
-            dest_dbs = fetch_databases(dest_conn)
-        except Exception as e:
-            screen_message(stdscr, "Erro", str(e))
-            try:
-                dest_conn.close()
-            except Exception:
-                pass
-            if close_origin:
-                try:
-                    origin_conn.close()
-                except Exception:
-                    pass
-            continue
-
-        origin_db = screen_pick(stdscr, "Origem - Database", origin_dbs)
-        if not origin_db:
-            try:
-                dest_conn.close()
-            except Exception:
-                pass
-            if close_origin:
-                try:
-                    origin_conn.close()
-                except Exception:
-                    pass
-            continue
-
-        dest_db = screen_pick(stdscr, "Destino - Database", dest_dbs)
-        if not dest_db:
-            try:
-                dest_conn.close()
-            except Exception:
-                pass
-            if close_origin:
-                try:
-                    origin_conn.close()
-                except Exception:
-                    pass
-            continue
-
-        mode = screen_menu(stdscr, "Espelhar Banco", ["Database inteiro", "Tabela(s)", "Voltar"])
-        if mode is None or mode == "Voltar":
-            try:
-                dest_conn.close()
-            except Exception:
-                pass
-            if close_origin:
-                try:
-                    origin_conn.close()
-                except Exception:
-                    pass
-            continue
-
-        try:
-            origin_conn.execute(f"USE [{origin_db}]")
-            tables = fetch_tables(origin_conn)
-        except Exception as e:
-            screen_message(stdscr, "Erro", str(e))
-            try:
-                dest_conn.close()
-            except Exception:
-                pass
-            if close_origin:
-                try:
-                    origin_conn.close()
-                except Exception:
-                    pass
-            continue
-
-        if mode == "Tabela(s)":
-            tables = screen_select_multi(stdscr, "Selecionar Tabelas", tables)
-            if not tables:
-                try:
-                    dest_conn.close()
-                except Exception:
-                    pass
-                if close_origin:
+            if focus == "origin":
+                origin_conn = new_conn
+                origin_label = f"{cur2.get('user','')}@{cur2.get('host','')}:{cur2.get('port','')}"
+                origin_current_db = cur2.get("database") or "master"
+                reset_origin_state()
+                selected_tables.clear()
+                selected_origin_db = None
+            else:
+                if dest_conn:
                     try:
-                        origin_conn.close()
+                        dest_conn.close()
                     except Exception:
                         pass
+                dest_conn = new_conn
+                dest_label = f"{cur2.get('user','')}@{cur2.get('host','')}:{cur2.get('port','')}"
+                dest_current_db = cur2.get("database") or "master"
+                reset_dest_state()
+                selected_dest_db = None
+            continue
+        if ch in (ord("r"), ord("R")):
+            reset_origin_state()
+            reset_dest_state()
+            continue
+        if ch == curses.KEY_F5:
+            if not dest_conn:
+                screen_message(stdscr, "Erro", "Conecte o destino.")
                 continue
-
-        confirm = screen_confirm(
-            stdscr,
-            "Confirmar Espelhamento",
-            "\n".join(
-                [
-                    f"Origem: {origin_label} / {origin_db}",
-                    f"Destino: {dest_label} / {dest_db}",
-                    f"Tabelas: {len(tables)}",
-                    "",
-                    "NÃO FECHAR O APP ATÉ FINALIZAR.",
-                ]
-            ),
-        )
-        if not confirm:
-            try:
-                dest_conn.close()
-            except Exception:
-                pass
-            if close_origin:
-                try:
-                    origin_conn.close()
-                except Exception:
-                    pass
+            if not selected_tables:
+                screen_message(stdscr, "Erro", "Selecione tabelas na origem (ESPACO).")
+                continue
+            if not selected_dest_db:
+                screen_message(stdscr, "Erro", "Selecione o DB destino (Enter no DB).")
+                continue
+            origin_db = selected_origin_db
+            tables = [t for (_, t) in sorted(selected_tables)]
+            confirm = screen_confirm(
+                stdscr,
+                "Confirmar Espelhamento",
+                "\n".join(
+                    [
+                        f"Origem: {origin_label} / {origin_db}",
+                        f"Destino: {dest_label} / {selected_dest_db}",
+                        f"Tabelas: {len(tables)}",
+                        "",
+                        "NÃO FECHAR O APP ATÉ FINALIZAR.",
+                    ]
+                ),
+            )
+            if not confirm:
+                continue
+            def progress_cb(t, idx, total, copied, total_rows):
+                nonlocal progress
+                progress = {
+                    "table": t,
+                    "idx": idx,
+                    "total": total,
+                    "rows_copied": copied,
+                    "rows_total": total_rows,
+                }
+            ok = mirror_tables(
+                stdscr,
+                origin_conn,
+                dest_conn,
+                origin_db,
+                selected_dest_db,
+                tables,
+                origin_label,
+                dest_label,
+                progress_cb=progress_cb,
+            )
+            progress = None
+            if ok:
+                screen_message(stdscr, "Concluido", "Espelhamento finalizado com sucesso.")
             continue
 
-        ok = mirror_tables(stdscr, origin_conn, dest_conn, origin_db, dest_db, tables, origin_label, dest_label)
-        try:
-            dest_conn.close()
-        except Exception:
-            pass
-        if close_origin:
-            try:
-                origin_conn.close()
-            except Exception:
-                pass
-        if ok:
-            screen_message(stdscr, "Concluido", "Espelhamento finalizado com sucesso.")
+        # navigation
+        if focus == "origin":
+            if ch in (curses.KEY_UP,):
+                origin_idx = (origin_idx - 1) % max(1, len(origin_items))
+                continue
+            if ch in (curses.KEY_DOWN,):
+                origin_idx = (origin_idx + 1) % max(1, len(origin_items))
+                continue
+            if not origin_items:
+                continue
+            item = origin_items[origin_idx]
+            if ch in (curses.KEY_RIGHT,):
+                if item["type"] == "db":
+                    db = item["db"]
+                    if db in origin_expanded:
+                        origin_expanded.remove(db)
+                    else:
+                        try:
+                            origin_tables_cache[db] = fetch_tables_for_db(origin_conn, origin_current_db, db)
+                        except Exception as e:
+                            screen_message(stdscr, "Erro", str(e))
+                        origin_expanded.add(db)
+                elif item["type"] == "table":
+                    key = (item["db"], item["table"])
+                    if key in origin_expanded_tables:
+                        origin_expanded_tables.remove(key)
+                    else:
+                        schema, table = split_table_name(item["table"])
+                        try:
+                            cols = fetch_columns_for_table(origin_conn, origin_current_db, item["db"], schema, table)
+                            origin_columns_cache[key] = [c[0] for c in cols]
+                        except Exception:
+                            origin_columns_cache[key] = []
+                        origin_expanded_tables.add(key)
+                continue
+            if ch in (curses.KEY_LEFT,):
+                if item["type"] == "db" and item["db"] in origin_expanded:
+                    origin_expanded.remove(item["db"])
+                if item["type"] == "table":
+                    key = (item["db"], item["table"])
+                    if key in origin_expanded_tables:
+                        origin_expanded_tables.remove(key)
+                continue
+            if ch in (curses.KEY_ENTER, 10, 13) and item["type"] == "db":
+                selected_origin_db = item["db"]
+                origin_current_db = item["db"]
+                selected_tables.clear()
+                continue
+            if ch in (ord(" "),) and item["type"] == "table":
+                if selected_origin_db and item["db"] != selected_origin_db:
+                    screen_message(stdscr, "Erro", "Selecione tabelas de apenas 1 database.")
+                    continue
+                selected_origin_db = item["db"]
+                key = (item["db"], item["table"])
+                if key in selected_tables:
+                    selected_tables.remove(key)
+                else:
+                    selected_tables.add(key)
+                continue
+        else:
+            if not dest_conn:
+                continue
+            if ch in (curses.KEY_UP,):
+                dest_idx = (dest_idx - 1) % max(1, len(dest_items))
+                continue
+            if ch in (curses.KEY_DOWN,):
+                dest_idx = (dest_idx + 1) % max(1, len(dest_items))
+                continue
+            if not dest_items:
+                continue
+            item = dest_items[dest_idx]
+            if ch in (curses.KEY_RIGHT,):
+                if item["type"] == "db":
+                    db = item["db"]
+                    if db in dest_expanded:
+                        dest_expanded.remove(db)
+                    else:
+                        try:
+                            dest_tables_cache[db] = fetch_tables_for_db(dest_conn, dest_current_db, db)
+                        except Exception as e:
+                            screen_message(stdscr, "Erro", str(e))
+                        dest_expanded.add(db)
+                elif item["type"] == "table":
+                    key = (item["db"], item["table"])
+                    if key in dest_expanded_tables:
+                        dest_expanded_tables.remove(key)
+                    else:
+                        schema, table = split_table_name(item["table"])
+                        try:
+                            cols = fetch_columns_for_table(dest_conn, dest_current_db, item["db"], schema, table)
+                            dest_columns_cache[key] = [c[0] for c in cols]
+                        except Exception:
+                            dest_columns_cache[key] = []
+                        dest_expanded_tables.add(key)
+                continue
+            if ch in (curses.KEY_LEFT,):
+                if item["type"] == "db" and item["db"] in dest_expanded:
+                    dest_expanded.remove(item["db"])
+                if item["type"] == "table":
+                    key = (item["db"], item["table"])
+                    if key in dest_expanded_tables:
+                        dest_expanded_tables.remove(key)
+                continue
+            if ch in (curses.KEY_ENTER, 10, 13) and item["type"] == "db":
+                selected_dest_db = item["db"]
+                dest_current_db = item["db"]
+                continue
 
 def screen_databases(stdscr, conn, current_db):
     try:
