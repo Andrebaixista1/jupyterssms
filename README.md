@@ -44,6 +44,7 @@ Para aparecer o icone personalizado na barra de aplicativos, abra pelo atalho cr
 - Shift+TAB: foco anterior.
 - Setas: navegar (em Results use ←/→ para colunas).
 - Enter: editar query ou selecionar item.
+- F9: modo avancado.
 - Ctrl+N: nova query (aba).
 - Ctrl+X: fechar query atual.
 - Ctrl+TAB: proxima query.
@@ -66,6 +67,10 @@ Para aparecer o icone personalizado na barra de aplicativos, abra pelo atalho cr
 - Export CSV com `;` e UTF-8 BOM.
 - Foco e clique com mouse (quando suportado pelo terminal).
 - Nao precisa de `dbo` ao gerar query (o app muda para o DB correto).
+- Modo avancado com espelhamento de banco/tabelas.
+
+## Modo Avancado
+- Espelhar Banco: escolhe host origem e destino, seleciona database ou tabelas, copia dados com barra de progresso.
 
 ## Configuracoes e logs
 - Config: `~/.config/jupyter-ssms/config.json`

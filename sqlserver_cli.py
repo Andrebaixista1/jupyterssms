@@ -435,6 +435,7 @@ def screen_help(stdscr):
             "- Esquerda: arvore (Server > Databases > Tables).",
             "- Direita (topo): editor SQL.",
             "- Direita (baixo): resultados.",
+            "- F9: modo avancado.",
             "- TAB: alterna foco (arvore/editor/resultados).",
             "- Shift+TAB: foco anterior.",
             "- Ctrl+N: nova query (aba).",
@@ -957,6 +958,16 @@ def build_table_ref(schema, table, db=None, include_db=False):
         return f"[{table}]"
     return f"[{schema}].[{table}]"
 
+def split_table_name(name):
+    if "." in name:
+        return name.split(".", 1)
+    return "dbo", name
+
+def build_insert_sql(schema, table, columns):
+    cols = ", ".join(f"[{c}]" for c in columns)
+    params = ", ".join(["?"] * len(columns))
+    return f"INSERT INTO {build_table_ref(schema, table)} ({cols}) VALUES ({params})"
+
 
 def editor_edit(stdscr, y, x, h, w, initial_sql):
     win = panel_window(stdscr, y, x, h, w, "SQLQuery_1")
@@ -1170,7 +1181,7 @@ def screen_workspace(stdscr, conn, cfg, current):
             toolbar = (
                 f"Database: {current.get('database') or 'master'} | "
                 f"Server: {current.get('host') or '-'}:{current.get('port') or '1433'} | "
-                f"User: {current.get('user') or '-'} | F5 Executar | TAB Foco | F1 Ajuda"
+                f"User: {current.get('user') or '-'} | F5 Executar | F9 Avancado | TAB Foco | F1 Ajuda"
             )
             safe_addstr(stdscr, top, 2, toolbar[: w - 4])
 
@@ -1275,7 +1286,7 @@ def screen_workspace(stdscr, conn, cfg, current):
                 safe_addstr(results_win, result_h - 2, 2, info[: right_w - 4])
 
             # Footer
-            footer = "ESC = Desconectar | R = Atualizar | TAB = Alternar foco | Shift+TAB = Foco anterior | Ctrl+N = Nova query | Ctrl+X = Fechar query | Ctrl+TAB = Trocar query | F6 = Salvar CSV | F1 = Ajuda"
+            footer = "ESC = Desconectar | R = Atualizar | F9 = Modo avancado | TAB = Alternar foco | Shift+TAB = Foco anterior | Ctrl+N = Nova query | Ctrl+X = Fechar query | Ctrl+TAB = Trocar query | F6 = Salvar CSV | F1 = Ajuda"
             safe_addstr(stdscr, h - 1, 2, footer[: w - 4])
 
             stdscr.refresh()
@@ -1289,6 +1300,9 @@ def screen_workspace(stdscr, conn, cfg, current):
                 continue
             if ch in (27,):
                 return "disconnect"
+            if ch == curses.KEY_F9:
+                screen_advanced(stdscr, cfg, current, conn)
+                continue
             if ch == curses.KEY_F6:
                 if res["cols"] is not None and res["rows"] is not None:
                     default_path = default_csv_path()
@@ -1609,6 +1623,346 @@ def screen_menu(stdscr, title, items):
         elif ch in (curses.KEY_ENTER, 10, 13):
             return items[idx]
 
+def screen_pick(stdscr, title, items, footer="Enter = Selecionar | ESC = Voltar"):
+    if not items:
+        screen_message(stdscr, title, "Nenhum item encontrado.")
+        return None
+    idx = 0
+    while True:
+        stdscr.clear()
+        draw_header(stdscr, title)
+        h, w = stdscr.getmaxyx()
+        max_lines = h - 4
+        start = 0
+        if idx >= max_lines:
+            start = idx - max_lines + 1
+        for i, item in enumerate(items[start : start + max_lines]):
+            y = 2 + i
+            attr = curses.A_REVERSE if (start + i) == idx else 0
+            safe_addstr(stdscr, y, 2, str(item)[: w - 4], attr)
+        safe_addstr(stdscr, h - 2, 2, footer[: w - 4])
+        stdscr.refresh()
+        ch = stdscr.getch()
+        if ch in (27,):
+            return None
+        if ch in (curses.KEY_UP,):
+            idx = (idx - 1) % len(items)
+        elif ch in (curses.KEY_DOWN,):
+            idx = (idx + 1) % len(items)
+        elif ch in (curses.KEY_ENTER, 10, 13):
+            return items[idx]
+
+def screen_select_multi(stdscr, title, items):
+    if not items:
+        screen_message(stdscr, title, "Nenhum item encontrado.")
+        return None
+    selected = [False] * len(items)
+    idx = 0
+    while True:
+        stdscr.clear()
+        draw_header(stdscr, title)
+        h, w = stdscr.getmaxyx()
+        max_lines = h - 4
+        start = 0
+        if idx >= max_lines:
+            start = idx - max_lines + 1
+        for i, item in enumerate(items[start : start + max_lines]):
+            idx_abs = start + i
+            mark = "[x]" if selected[idx_abs] else "[ ]"
+            line = f"{mark} {item}"
+            attr = curses.A_REVERSE if idx_abs == idx else 0
+            safe_addstr(stdscr, 2 + i, 2, line[: w - 4], attr)
+        safe_addstr(stdscr, h - 2, 2, "Espaco = marcar | Enter = confirmar | ESC = voltar")
+        stdscr.refresh()
+        ch = stdscr.getch()
+        if ch in (27,):
+            return None
+        if ch in (curses.KEY_UP,):
+            idx = (idx - 1) % len(items)
+        elif ch in (curses.KEY_DOWN,):
+            idx = (idx + 1) % len(items)
+        elif ch in (ord(" "),):
+            selected[idx] = not selected[idx]
+        elif ch in (curses.KEY_ENTER, 10, 13):
+            chosen = [items[i] for i, flag in enumerate(selected) if flag]
+            if chosen:
+                return chosen
+
+def screen_confirm(stdscr, title, message):
+    stdscr.clear()
+    draw_header(stdscr, title)
+    h, w = stdscr.getmaxyx()
+    lines = message.splitlines()
+    for i, line in enumerate(lines[: h - 4]):
+        safe_addstr(stdscr, 2 + i, 2, line[: w - 4])
+    safe_addstr(stdscr, h - 2, 2, "Enter = Iniciar | ESC = Cancelar")
+    stdscr.refresh()
+    while True:
+        ch = stdscr.getch()
+        if ch in (27,):
+            return False
+        if ch in (curses.KEY_ENTER, 10, 13):
+            return True
+
+def render_progress(stdscr, title, origin_label, dest_label, table_name, table_idx, table_total, copied, total):
+    stdscr.clear()
+    draw_header(stdscr, title)
+    h, w = stdscr.getmaxyx()
+    safe_addstr(stdscr, 2, 2, "NÃO FECHAR O APP ATÉ FINALIZAR")
+    safe_addstr(stdscr, 4, 2, f"Origem: {origin_label}"[: w - 4])
+    safe_addstr(stdscr, 5, 2, f"Destino: {dest_label}"[: w - 4])
+    safe_addstr(stdscr, 7, 2, f"Tabela {table_idx}/{table_total}: {table_name}"[: w - 4])
+    if total > 0:
+        percent = int((copied / total) * 100)
+    else:
+        percent = 0
+    bar_w = max(10, w - 10)
+    filled = int((percent / 100) * bar_w)
+    bar = "[" + "#" * filled + "-" * (bar_w - filled) + "]"
+    safe_addstr(stdscr, 9, 2, bar[: w - 4])
+    safe_addstr(stdscr, 10, 2, f"{copied}/{total} linhas ({percent}%)"[: w - 4])
+    stdscr.refresh()
+
+def mirror_tables(stdscr, origin_conn, dest_conn, origin_db, dest_db, tables, origin_label, dest_label):
+    try:
+        origin_conn.execute(f"USE [{origin_db}]")
+        dest_conn.execute(f"USE [{dest_db}]")
+    except Exception as e:
+        screen_message(stdscr, "Erro", str(e))
+        return False
+    total_tables = len(tables)
+    batch_size = 1000
+    for idx, t in enumerate(tables, start=1):
+        schema, table = split_table_name(t)
+        try:
+            cols = fetch_columns(origin_conn, schema, table)
+            col_names = [c[0] for c in cols]
+            if not col_names:
+                continue
+            select_cols = ", ".join(f"[{c}]" for c in col_names)
+            select_sql = f"SELECT {select_cols} FROM {build_table_ref(schema, table)}"
+            insert_sql = build_insert_sql(schema, table, col_names)
+            try:
+                total = origin_conn.execute(f"SELECT COUNT(*) FROM {build_table_ref(schema, table)}").fetchone()[0]
+            except Exception:
+                total = 0
+            copied = 0
+            cur = origin_conn.cursor()
+            cur.execute(select_sql)
+            dest_cur = dest_conn.cursor()
+            try:
+                dest_cur.fast_executemany = True
+            except Exception:
+                pass
+            render_progress(stdscr, "Modo Avançado - Espelhar Banco", origin_label, dest_label, t, idx, total_tables, copied, total)
+            while True:
+                rows = cur.fetchmany(batch_size)
+                if not rows:
+                    break
+                dest_cur.executemany(insert_sql, rows)
+                copied += len(rows)
+                render_progress(stdscr, "Modo Avançado - Espelhar Banco", origin_label, dest_label, t, idx, total_tables, copied, total)
+        except Exception as e:
+            screen_message(stdscr, "Erro", f"{t}\n{e}")
+            return False
+    return True
+
+def screen_advanced(stdscr, cfg, current, conn):
+    while True:
+        choice = screen_menu(stdscr, "Modo Avançado", ["Espelhar Banco", "Voltar"])
+        if choice != "Espelhar Banco":
+            return
+
+        origin_choice = screen_menu(
+            stdscr,
+            "Espelhar Banco - Origem",
+            [
+                f"Usar conexao atual ({current.get('user','')}@{current.get('host','')}:{current.get('port','')}/{current.get('database','')})",
+                "Outra conexao de origem",
+                "Voltar",
+            ],
+        )
+        if origin_choice is None or origin_choice == "Voltar":
+            continue
+
+        origin_conn = conn
+        origin_label = f"{current.get('user','')}@{current.get('host','')}:{current.get('port','')}"
+        origin_db_default = current.get("database") or "master"
+        close_origin = False
+
+        if origin_choice.startswith("Outra"):
+            tmp_current = {
+                "name": "",
+                "host": "",
+                "port": cfg.get("port", "1433") or "1433",
+                "user": "",
+                "database": "master",
+                "driver": cfg.get("driver", "ODBC Driver 18 for SQL Server"),
+            }
+            cfg2, cur2, pwd2 = screen_connect(stdscr, cfg, tmp_current, "")
+            if cfg2 is None:
+                continue
+            conn_cfg = dict(cfg2)
+            conn_cfg.update(cur2)
+            origin_conn, err = connect_db(conn_cfg, pwd2)
+            if err:
+                screen_message(stdscr, "Erro", err)
+                continue
+            origin_label = f"{cur2.get('user','')}@{cur2.get('host','')}:{cur2.get('port','')}"
+            origin_db_default = cur2.get("database") or "master"
+            close_origin = True
+
+        tmp_current = {
+            "name": "",
+            "host": "",
+            "port": cfg.get("port", "1433") or "1433",
+            "user": "",
+            "database": "master",
+            "driver": cfg.get("driver", "ODBC Driver 18 for SQL Server"),
+        }
+        cfg3, cur3, pwd3 = screen_connect(stdscr, cfg, tmp_current, "")
+        if cfg3 is None:
+            if close_origin:
+                try:
+                    origin_conn.close()
+                except Exception:
+                    pass
+            continue
+        conn_cfg = dict(cfg3)
+        conn_cfg.update(cur3)
+        dest_conn, err = connect_db(conn_cfg, pwd3)
+        if err:
+            if close_origin:
+                try:
+                    origin_conn.close()
+                except Exception:
+                    pass
+            screen_message(stdscr, "Erro", err)
+            continue
+        dest_label = f"{cur3.get('user','')}@{cur3.get('host','')}:{cur3.get('port','')}"
+
+        try:
+            origin_dbs = fetch_databases(origin_conn)
+            dest_dbs = fetch_databases(dest_conn)
+        except Exception as e:
+            screen_message(stdscr, "Erro", str(e))
+            try:
+                dest_conn.close()
+            except Exception:
+                pass
+            if close_origin:
+                try:
+                    origin_conn.close()
+                except Exception:
+                    pass
+            continue
+
+        origin_db = screen_pick(stdscr, "Origem - Database", origin_dbs)
+        if not origin_db:
+            try:
+                dest_conn.close()
+            except Exception:
+                pass
+            if close_origin:
+                try:
+                    origin_conn.close()
+                except Exception:
+                    pass
+            continue
+
+        dest_db = screen_pick(stdscr, "Destino - Database", dest_dbs)
+        if not dest_db:
+            try:
+                dest_conn.close()
+            except Exception:
+                pass
+            if close_origin:
+                try:
+                    origin_conn.close()
+                except Exception:
+                    pass
+            continue
+
+        mode = screen_menu(stdscr, "Espelhar Banco", ["Database inteiro", "Tabela(s)", "Voltar"])
+        if mode is None or mode == "Voltar":
+            try:
+                dest_conn.close()
+            except Exception:
+                pass
+            if close_origin:
+                try:
+                    origin_conn.close()
+                except Exception:
+                    pass
+            continue
+
+        try:
+            origin_conn.execute(f"USE [{origin_db}]")
+            tables = fetch_tables(origin_conn)
+        except Exception as e:
+            screen_message(stdscr, "Erro", str(e))
+            try:
+                dest_conn.close()
+            except Exception:
+                pass
+            if close_origin:
+                try:
+                    origin_conn.close()
+                except Exception:
+                    pass
+            continue
+
+        if mode == "Tabela(s)":
+            tables = screen_select_multi(stdscr, "Selecionar Tabelas", tables)
+            if not tables:
+                try:
+                    dest_conn.close()
+                except Exception:
+                    pass
+                if close_origin:
+                    try:
+                        origin_conn.close()
+                    except Exception:
+                        pass
+                continue
+
+        confirm = screen_confirm(
+            stdscr,
+            "Confirmar Espelhamento",
+            "\n".join(
+                [
+                    f"Origem: {origin_label} / {origin_db}",
+                    f"Destino: {dest_label} / {dest_db}",
+                    f"Tabelas: {len(tables)}",
+                    "",
+                    "NÃO FECHAR O APP ATÉ FINALIZAR.",
+                ]
+            ),
+        )
+        if not confirm:
+            try:
+                dest_conn.close()
+            except Exception:
+                pass
+            if close_origin:
+                try:
+                    origin_conn.close()
+                except Exception:
+                    pass
+            continue
+
+        ok = mirror_tables(stdscr, origin_conn, dest_conn, origin_db, dest_db, tables, origin_label, dest_label)
+        try:
+            dest_conn.close()
+        except Exception:
+            pass
+        if close_origin:
+            try:
+                origin_conn.close()
+            except Exception:
+                pass
+        if ok:
+            screen_message(stdscr, "Concluido", "Espelhamento finalizado com sucesso.")
 
 def screen_databases(stdscr, conn, current_db):
     try:
