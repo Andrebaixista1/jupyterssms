@@ -2,7 +2,8 @@
 
 CLI/TUI estilo "tela preta" para navegar em bancos SQL Server via Linux, com setas e execucao de queries.
 
-Versao: Io v0.06022026
+Versao: Io v1.06022026  
+Criado e desenvolvido por André Felipe Pinto © 2026
 
 ## Requisitos
 - Linux Mint/Ubuntu
@@ -31,13 +32,33 @@ cd /home/andrefelipe/projetos/sqlserver-cli
 python3 sqlserver_cli.py
 ```
 
+## Layout (estilo SSMS)
+- Esquerda: arvore (Server > Databases > Tables).
+- Direita (topo): editor SQL.
+- Direita (baixo): resultados.
+
 ## Teclas
-- Setas: navegar
-- Enter: selecionar/editar
-- F2: conectar/executar query
-- ESC: voltar/sair
-- R: atualizar lista
+- TAB: alternar foco (arvore/editor/resultados).
+- Setas: navegar (em Results use ←/→ para colunas).
+- Enter: editar query ou selecionar item.
+- F1: ajuda.
+- F2: conectar.
+- F5: executar query.
+- F6: salvar resultados em CSV (separador `;`, abre dialogo do sistema).
+- ESC: voltar/sair.
+- R: atualizar listas.
+
+## Recursos
+- Historico de conexoes no topo da tela inicial (selecionavel).
+- Nome para conexoes (facilita reutilizar).
+- Export CSV com `;` e UTF-8 BOM.
+- Foco e clique com mouse (quando suportado pelo terminal).
+- Nao precisa de `dbo` ao gerar query (o app muda para o DB correto).
+
+## Configuracoes e logs
+- Config: `~/.config/jupyter-ssms/config.json`
+- Log: `~/.local/share/jupyter-ssms/jupyter_ssms.log`
 
 ## Notas
-- Senha nao e salva no `config.json`.
+- Senha so e salva se `SalvarSenha` estiver ligado.
 - CRUD e feito via queries reais. O menu cria templates e voce edita antes de executar.

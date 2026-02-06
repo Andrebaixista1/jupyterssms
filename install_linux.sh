@@ -60,6 +60,23 @@ ensure_pip_pkg() {
   fi
 }
 
+install_pyodbc() {
+  if pkg_installed python3-pyodbc; then
+    ok "python3-pyodbc"
+    return 0
+  fi
+  doing "Instalando: python3-pyodbc (apt)"
+  if sudo apt-get install -y python3-pyodbc; then
+    ok "python3-pyodbc"
+    return 0
+  fi
+
+  # fallback pip
+  doing "Falhou via apt. Usando pip para pyodbc..."
+  ensure_pkgs build-essential python3-dev unixodbc-dev
+  ensure_pip_pkg pyodbc
+}
+
 # Detect Ubuntu base (Linux Mint usa Ubuntu como base)
 source /etc/os-release
 
@@ -99,6 +116,7 @@ log "Ubuntu base detectado: $ubuntu_ver"
 log "Instalando dependencias..."
 sudo apt-get update
 ensure_pkgs ca-certificates curl gnupg
+ensure_pkgs zenity
 
 log "Baixando repositorio da Microsoft..."
 tmpdir="$(mktemp -d)"
@@ -166,7 +184,7 @@ cat > "$desktop_file" <<EOF
 [Desktop Entry]
 Type=Application
 Name=Jupyter-SSMS
-Comment=SQL Server TUI (Io v0.06022026)
+Comment=SQL Server TUI (Io v1.06022026)
 Exec=python3 $app_dir/sqlserver_cli.py
 Path=$app_dir
 Terminal=true
@@ -180,6 +198,6 @@ cp -f "$desktop_file" "$HOME/.local/share/applications/jupyter-ssms.desktop"
 
 log "Atalho criado em: $desktop_file"
 log "Instalando dependencias Python..."
-ensure_pip_pkg pyodbc
+install_pyodbc
 
 log "Concluido. Verifique com: odbcinst -q -d"
