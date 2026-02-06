@@ -126,6 +126,108 @@ def safe_keypad(win, enabled=True):
     except curses.error:
         pass
 
+def split_line_at_cursor(win):
+    try:
+        maxy, maxx = win.getmaxyx()
+        y, x = win.getyx()
+    except Exception:
+        return
+    if y >= maxy - 1:
+        return
+    remainder_chars = []
+    for col in range(x, maxx):
+        try:
+            ch = win.inch(y, col)
+            c = curses.ascii.ascii(ch)
+            if c == 0:
+                c = curses.ascii.SP
+            remainder_chars.append(chr(c))
+        except curses.error:
+            break
+    remainder = "".join(remainder_chars).rstrip()
+    try:
+        win.move(y, x)
+        win.clrtoeol()
+        win.move(y + 1, 0)
+        win.insertln()
+        if remainder:
+            win.addstr(y + 1, 0, remainder[:maxx])
+        win.move(y + 1, 0)
+    except curses.error:
+        pass
+
+def insert_newline_at_cursor(box):
+    win = box.win
+    try:
+        maxy, maxx = win.getmaxyx()
+        y, x = win.getyx()
+    except Exception:
+        return
+    try:
+        text = box.gather()
+    except Exception:
+        return
+    lines = text.splitlines()
+    if len(lines) < maxy:
+        lines.extend([""] * (maxy - len(lines)))
+    if y >= len(lines):
+        return
+    line = lines[y]
+    if x > len(line):
+        x = len(line)
+    left = line[:x]
+    right = line[x:]
+    lines[y] = left
+    if y + 1 <= len(lines):
+        lines.insert(y + 1, right)
+    else:
+        lines.append(right)
+    lines = lines[:maxy]
+    win.erase()
+    for row, text in enumerate(lines):
+        try:
+            win.addstr(row, 0, text.rstrip()[: maxx - 1])
+        except curses.error:
+            pass
+    try:
+        win.move(min(y + 1, maxy - 1), 0)
+    except curses.error:
+        pass
+
+def delete_forward_at_cursor(box):
+    win = box.win
+    try:
+        maxy, maxx = win.getmaxyx()
+        y, x = win.getyx()
+    except Exception:
+        return
+    try:
+        text = box.gather()
+    except Exception:
+        return
+    lines = text.splitlines()
+    if len(lines) < maxy:
+        lines.extend([""] * (maxy - len(lines)))
+    if y >= len(lines):
+        return
+    line = lines[y]
+    if x < len(line):
+        lines[y] = line[:x] + line[x + 1 :]
+    elif y + 1 < len(lines):
+        lines[y] = line + lines[y + 1]
+        del lines[y + 1]
+    lines = lines[:maxy]
+    win.erase()
+    for row, text in enumerate(lines):
+        try:
+            win.addstr(row, 0, text.rstrip()[: maxx - 1])
+        except curses.error:
+            pass
+    try:
+        win.move(min(y, maxy - 1), min(x, maxx - 1))
+    except curses.error:
+        pass
+
 def get_clipboard_text():
     for cmd in (
         ["wl-paste", "-n"],
@@ -818,57 +920,23 @@ def panel_query_editor(stdscr, conn, y, x, h, w, initial_sql=""):
     edit_x = x + 2
     txt_win = curses.newwin(edit_h, edit_w, edit_y, edit_x)
     safe_keypad(txt_win, True)
-    txt_win.addstr(0, 0, initial_sql)
+    txt_win.erase()
     txt_win.refresh()
-    box = curses.textpad.Textbox(txt_win, insert_mode=True)
 
-    state = {"cancel": False}
-
-    def validator(ch):
-        if ch == curses.KEY_DC:
-            return curses.KEY_BACKSPACE
-        if ch in (curses.KEY_ENTER, 10, 13):
-            box.do_command(curses.ascii.SI)
-            box.do_command(curses.ascii.NL)
-            return 0
-        if ch == 3:  # Ctrl+C
-            text = box.gather().rstrip()
-            if text:
-                set_clipboard_text(text)
-            return 0
-        if ch == 22:  # Ctrl+V
-            text = get_clipboard_text()
-            if text:
-                for c in text:
-                    if c == "\r":
-                        continue
-                    if c == "\n":
-                        box.do_command(curses.ascii.NL)
-                    else:
-                        box.do_command(ord(c))
-            return 0
-        if ch in (curses.KEY_HOME, 262):
-            return 1  # Ctrl+A
-        if ch in (curses.KEY_END, 360):
-            return 5  # Ctrl+E
-        if ch == curses.KEY_F2:
-            return 7  # Ctrl+G
-        if ch == curses.KEY_F1:
-            screen_help(stdscr)
-            win = panel_window(stdscr, y, x, h, w, "Query")
-            safe_addstr(win, 1, 2, "F2 executar | F1 ajuda | ESC voltar")
-            win.refresh()
-            txt_win.refresh()
-            return 0
-        if ch == 27:
-            state["cancel"] = True
-            return 7
-        return ch
-
+    actions = {
+        curses.KEY_F2: "execute",
+        27: "cancel",
+    }
     safe_curs_set(1)
-    content = box.edit(validator)
+    content, action = edit_text_multiline(
+        stdscr,
+        txt_win,
+        initial_sql,
+        action_keys=actions,
+        help_callback=lambda: screen_help(stdscr),
+    )
     safe_curs_set(0)
-    if state["cancel"]:
+    if action == "cancel":
         return initial_sql
     sql = content.strip()
     if not sql:
@@ -968,6 +1036,147 @@ def build_insert_sql(schema, table, columns):
     params = ", ".join(["?"] * len(columns))
     return f"INSERT INTO {build_table_ref(schema, table)} ({cols}) VALUES ({params})"
 
+def edit_text_multiline(stdscr, win, initial_text, action_keys=None, help_callback=None):
+    maxy, maxx = win.getmaxyx()
+    lines = initial_text.splitlines() or [""]
+    cy = 0
+    cx = 0
+    scroll_y = 0
+    scroll_x = 0
+
+    def ensure_cursor_visible():
+        nonlocal scroll_y, scroll_x
+        if cy < scroll_y:
+            scroll_y = cy
+        if cy >= scroll_y + maxy:
+            scroll_y = cy - maxy + 1
+        if cx < scroll_x:
+            scroll_x = cx
+        if cx >= scroll_x + maxx:
+            scroll_x = cx - maxx + 1
+
+    def render():
+        win.erase()
+        for i in range(maxy):
+            row = scroll_y + i
+            if row >= len(lines):
+                break
+            line = lines[row]
+            view = line[scroll_x : scroll_x + maxx]
+            try:
+                win.addstr(i, 0, view)
+            except curses.error:
+                pass
+        screen_y = max(0, min(cy - scroll_y, maxy - 1))
+        screen_x = max(0, min(cx - scroll_x, maxx - 1))
+        try:
+            win.move(screen_y, screen_x)
+        except curses.error:
+            pass
+        win.refresh()
+
+    def insert_char(ch):
+        nonlocal cx
+        line = lines[cy]
+        lines[cy] = line[:cx] + ch + line[cx:]
+        cx += 1
+
+    def insert_newline():
+        nonlocal cy, cx
+        line = lines[cy]
+        left = line[:cx]
+        right = line[cx:]
+        lines[cy] = left
+        lines.insert(cy + 1, right)
+        cy += 1
+        cx = 0
+
+    def backspace():
+        nonlocal cy, cx
+        if cx > 0:
+            line = lines[cy]
+            lines[cy] = line[:cx - 1] + line[cx:]
+            cx -= 1
+        elif cy > 0:
+            prev = lines[cy - 1]
+            line = lines[cy]
+            cx = len(prev)
+            lines[cy - 1] = prev + line
+            del lines[cy]
+            cy -= 1
+
+    def delete_forward():
+        nonlocal cy, cx
+        line = lines[cy]
+        if cx < len(line):
+            lines[cy] = line[:cx] + line[cx + 1 :]
+        elif cy < len(lines) - 1:
+            lines[cy] = line + lines[cy + 1]
+            del lines[cy + 1]
+
+    def paste_text(text):
+        nonlocal cy, cx
+        text = text.replace("\r\n", "\n").replace("\r", "\n")
+        for ch in text:
+            if ch == "\n":
+                insert_newline()
+            else:
+                insert_char(ch)
+
+    while True:
+        ensure_cursor_visible()
+        render()
+        ch = win.getch()
+
+        if action_keys and ch in action_keys:
+            return "\n".join(lines), action_keys[ch]
+
+        if ch == curses.KEY_F1 and help_callback:
+            help_callback()
+            continue
+
+        if ch in (curses.KEY_UP,):
+            if cy > 0:
+                cy -= 1
+                cx = min(cx, len(lines[cy]))
+        elif ch in (curses.KEY_DOWN,):
+            if cy < len(lines) - 1:
+                cy += 1
+                cx = min(cx, len(lines[cy]))
+        elif ch in (curses.KEY_LEFT,):
+            if cx > 0:
+                cx -= 1
+            elif cy > 0:
+                cy -= 1
+                cx = len(lines[cy])
+        elif ch in (curses.KEY_RIGHT,):
+            if cx < len(lines[cy]):
+                cx += 1
+            elif cy < len(lines) - 1:
+                cy += 1
+                cx = 0
+        elif ch in (curses.KEY_HOME, 262):
+            cx = 0
+        elif ch in (curses.KEY_END, 360):
+            cx = len(lines[cy])
+        elif ch in (curses.KEY_BACKSPACE, 127, 8):
+            backspace()
+        elif ch == curses.KEY_DC:
+            delete_forward()
+        elif ch in (curses.KEY_ENTER, 10, 13):
+            insert_newline()
+        elif ch == 3:  # Ctrl+C
+            set_clipboard_text("\n".join(lines))
+        elif ch == 22:  # Ctrl+V
+            paste_text(get_clipboard_text())
+        elif 32 <= ch <= 126:
+            insert_char(chr(ch))
+        elif 128 <= ch <= 255:
+            try:
+                insert_char(chr(ch))
+            except Exception:
+                pass
+
 
 def editor_edit(stdscr, y, x, h, w, initial_sql):
     win = panel_window(stdscr, y, x, h, w, "SQLQuery_1")
@@ -976,107 +1185,42 @@ def editor_edit(stdscr, y, x, h, w, initial_sql):
     edit_w = max(10, w - 4)
     txt_win = curses.newwin(edit_h, edit_w, y + 2, x + 2)
     safe_keypad(txt_win, True)
-    lines = initial_sql.splitlines() or [""]
-    for i, line in enumerate(lines[:edit_h]):
-        txt_win.addstr(i, 0, line[: edit_w - 1])
+    txt_win.erase()
     txt_win.refresh()
-    box = curses.textpad.Textbox(txt_win, insert_mode=True)
 
-    state = {"cancel": False, "execute": False, "tab": None, "switch_tab": None, "new_tab": False, "close_tab": False}
-
-    def validator(ch):
-        if ch == curses.KEY_DC:
-            return curses.KEY_BACKSPACE
-        if ch in (curses.KEY_ENTER, 10, 13):
-            box.do_command(curses.ascii.SI)
-            box.do_command(curses.ascii.NL)
-            return 0
-        if ch == 3:  # Ctrl+C
-            text = box.gather().rstrip()
-            if text:
-                set_clipboard_text(text)
-            return 0
-        if ch == 22:  # Ctrl+V
-            text = get_clipboard_text()
-            if text:
-                for c in text:
-                    if c == "\r":
-                        continue
-                    if c == "\n":
-                        box.do_command(curses.ascii.NL)
-                    else:
-                        box.do_command(ord(c))
-            return 0
-        if ch in (curses.KEY_HOME, 262):
-            return 1  # Ctrl+A
-        if ch in (curses.KEY_END, 360):
-            return 5  # Ctrl+E
-        if ch == curses.ascii.SO:  # Ctrl+N
-            state["new_tab"] = True
-            return 7
-        if ch == curses.ascii.CAN:  # Ctrl+X
-            state["close_tab"] = True
-            return 7
-        if ch in (curses.KEY_CTAB, 341):
-            state["switch_tab"] = "next"
-            return 7
-        if ch in (curses.KEY_CATAB, 342):
-            state["switch_tab"] = "prev"
-            return 7
-        if ch == curses.KEY_F8:
-            state["switch_tab"] = "next"
-            return 7
-        if ch == curses.KEY_F7:
-            state["switch_tab"] = "prev"
-            return 7
-        if ch == curses.KEY_F5:
-            state["execute"] = True
-            return 7
-        if ch == curses.KEY_F2:
-            state["execute"] = True
-            return 7
-        if ch == 9:
-            state["tab"] = "next"
-            return 7
-        if ch in (curses.KEY_BTAB, 353):
-            state["tab"] = "prev"
-            return 7
-        if ch == curses.KEY_F1:
-            screen_help(stdscr)
-            win = panel_window(stdscr, y, x, h, w, "SQLQuery_1")
-            safe_addstr(win, 1, 2, "F5 executar | F1 ajuda | ESC voltar")
-            win.refresh()
-            txt_win.refresh()
-            return 0
-        if ch == 27:
-            state["cancel"] = True
-            return 7
-        return ch
+    actions = {
+        curses.KEY_F5: "execute",
+        curses.KEY_F2: "execute",
+        9: "tab_next",
+        curses.KEY_BTAB: "tab_prev",
+        353: "tab_prev",
+        curses.ascii.SO: "new_tab",   # Ctrl+N
+        curses.ascii.CAN: "close_tab",# Ctrl+X
+        curses.KEY_CTAB: "switch_tab_next",
+        341: "switch_tab_next",
+        curses.KEY_CATAB: "switch_tab_prev",
+        342: "switch_tab_prev",
+        curses.KEY_F8: "switch_tab_next",
+        curses.KEY_F7: "switch_tab_prev",
+        27: "cancel",
+    }
 
     safe_curs_set(1)
-    content = box.edit(validator)
+    content, action = edit_text_multiline(
+        stdscr,
+        txt_win,
+        initial_sql,
+        action_keys=actions,
+        help_callback=lambda: screen_help(stdscr),
+    )
     safe_curs_set(0)
-    if state["cancel"]:
+    if action == "cancel":
         return initial_sql, None
     sql = content.strip()
     sql = normalize_editor_text(sql, initial_sql)
     if not sql:
-        if state["new_tab"]:
-            return initial_sql, "new_tab"
-        if state["switch_tab"]:
-            return initial_sql, f"switch_tab_{state['switch_tab']}"
-        return initial_sql, f"tab_{state['tab']}" if state["tab"] else None
-    if state["execute"]:
-        return sql, "execute"
-    if state["new_tab"]:
-        return sql, "new_tab"
-    if state["close_tab"]:
-        return sql, "close_tab"
-    if state["switch_tab"]:
-        return sql, f"switch_tab_{state['switch_tab']}"
-    if state["tab"]:
-        return sql, f"tab_{state['tab']}"
-    return sql, "edited"
+        return initial_sql, action
+    return sql, action or "edited"
 
 
 def screen_workspace(stdscr, conn, cfg, current):
@@ -2078,18 +2222,20 @@ def screen_query(stdscr, conn, initial_sql=""):
     edit_win.border()
     txt_win = curses.newwin(edit_h - 2, edit_w - 2, 5, 3)
     safe_keypad(txt_win, True)
+    txt_win.erase()
     txt_win.addstr(0, 0, initial_sql)
     txt_win.refresh()
     box = curses.textpad.Textbox(txt_win, insert_mode=True)
+    box.stripspaces = 0
 
     state = {"cancel": False}
 
     def validator(ch):
         if ch == curses.KEY_DC:
-            return curses.KEY_BACKSPACE
+            delete_forward_at_cursor(box)
+            return 0
         if ch in (curses.KEY_ENTER, 10, 13):
-            box.do_command(curses.ascii.SI)
-            box.do_command(curses.ascii.NL)
+            insert_newline_at_cursor(box)
             return 0
         if ch == 3:  # Ctrl+C
             text = box.gather().rstrip()
