@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import curses
+import curses.ascii
 import curses.textpad
 import csv
 import json
@@ -107,6 +108,52 @@ def safe_start_color():
     except curses.error:
         pass
 
+def safe_raw():
+    try:
+        curses.raw()
+    except curses.error:
+        pass
+
+def safe_noraw():
+    try:
+        curses.noraw()
+    except curses.error:
+        pass
+
+def safe_keypad(win, enabled=True):
+    try:
+        win.keypad(enabled)
+    except curses.error:
+        pass
+
+def get_clipboard_text():
+    for cmd in (
+        ["wl-paste", "-n"],
+        ["xclip", "-selection", "clipboard", "-o"],
+        ["xsel", "--clipboard", "--output"],
+    ):
+        try:
+            proc = subprocess.run(cmd, capture_output=True, text=True, check=True)
+            return proc.stdout or ""
+        except Exception:
+            continue
+    return ""
+
+def set_clipboard_text(text):
+    if text is None:
+        return False
+    for cmd in (
+        ["wl-copy"],
+        ["xclip", "-selection", "clipboard"],
+        ["xsel", "--clipboard", "--input"],
+    ):
+        try:
+            subprocess.run(cmd, input=text, text=True, check=True)
+            return True
+        except Exception:
+            continue
+    return False
+
 
 def draw_header(win, title):
     h, w = win.getmaxyx()
@@ -172,7 +219,7 @@ def connect_db(cfg, password):
         return None, "pyodbc nao instalado"
     try:
         conn_str = build_conn_str(cfg, password)
-        conn = pyodbc.connect(conn_str, timeout=5)
+        conn = pyodbc.connect(conn_str, timeout=5, autocommit=True)
         return conn, None
     except Exception as e:
         return None, str(e)
@@ -290,12 +337,29 @@ def format_table_view(cols, rows, start_row, max_rows, max_cell=60, sample=200):
     return lines, total_width
 
 
-def normalize_editor_text(text):
-    lines = [l.rstrip() for l in text.splitlines()]
+def normalize_editor_text(text, reference=None):
+    def clean_line(line):
+        # Remove control characters (e.g., NUL) that can appear from curses buffers
+        return "".join(ch for ch in line if ch == "\t" or ch >= " ")
+
+    lines = [clean_line(l).rstrip() for l in text.splitlines()]
     non_empty = [l for l in lines if l.strip()]
-    if len(non_empty) >= 2 and all(l == non_empty[0] for l in non_empty):
-        return non_empty[0]
-    return text
+    if not non_empty:
+        return "\n".join(lines)
+
+    def norm_line(line):
+        return " ".join(line.split())
+
+    norms = [norm_line(l) for l in non_empty]
+    if reference:
+        ref_clean = clean_line(reference)
+        ref_norm = norm_line(ref_clean)
+        if all(n == ref_norm for n in norms):
+            # If the original text was a single line, collapse duplicated lines
+            if "\n" not in ref_clean:
+                return ref_clean.strip()
+            return ref_clean.strip("\n")
+    return "\n".join(lines)
 
 
 def default_csv_path():
@@ -372,6 +436,13 @@ def screen_help(stdscr):
             "- Direita (topo): editor SQL.",
             "- Direita (baixo): resultados.",
             "- TAB: alterna foco (arvore/editor/resultados).",
+            "- Shift+TAB: foco anterior.",
+            "- Ctrl+N: nova query (aba).",
+            "- Ctrl+TAB: proxima query.",
+            "- Ctrl+Shift+TAB: query anterior.",
+            "- Ctrl+C: copiar texto do editor.",
+            "- Ctrl+V: colar no editor.",
+            "- Home/End: inicio/fim da linha no editor.",
             "- F5: executar query.",
             "- F6: exportar resultados para CSV (separador ';').",
             "- Ao salvar: abre o gerenciador de arquivos (se disponivel).",
@@ -698,6 +769,7 @@ def screen_connect(stdscr, cfg, current, password):
 def panel_window(stdscr, y, x, h, w, title, focused=False):
     win = curses.newwin(h, w, y, x)
     win.clear()
+    safe_keypad(win, True)
     if focused and FOCUS_ATTR:
         win.attron(FOCUS_ATTR)
         win.border()
@@ -742,6 +814,7 @@ def panel_query_editor(stdscr, conn, y, x, h, w, initial_sql=""):
     edit_y = y + 2
     edit_x = x + 2
     txt_win = curses.newwin(edit_h, edit_w, edit_y, edit_x)
+    safe_keypad(txt_win, True)
     txt_win.addstr(0, 0, initial_sql)
     txt_win.refresh()
     box = curses.textpad.Textbox(txt_win, insert_mode=True)
@@ -749,6 +822,28 @@ def panel_query_editor(stdscr, conn, y, x, h, w, initial_sql=""):
     state = {"cancel": False}
 
     def validator(ch):
+        if ch == curses.KEY_DC:
+            return curses.KEY_BACKSPACE
+        if ch == 3:  # Ctrl+C
+            text = box.gather().rstrip()
+            if text:
+                set_clipboard_text(text)
+            return 0
+        if ch == 22:  # Ctrl+V
+            text = get_clipboard_text()
+            if text:
+                for c in text:
+                    if c == "\r":
+                        continue
+                    if c == "\n":
+                        box.do_command(curses.ascii.NL)
+                    else:
+                        box.do_command(ord(c))
+            return 0
+        if ch in (curses.KEY_HOME, 262):
+            return 1  # Ctrl+A
+        if ch in (curses.KEY_END, 360):
+            return 5  # Ctrl+E
         if ch == curses.KEY_F2:
             return 7  # Ctrl+G
         if ch == curses.KEY_F1:
@@ -863,23 +958,58 @@ def editor_edit(stdscr, y, x, h, w, initial_sql):
     edit_h = max(3, h - 4)
     edit_w = max(10, w - 4)
     txt_win = curses.newwin(edit_h, edit_w, y + 2, x + 2)
+    safe_keypad(txt_win, True)
     lines = initial_sql.splitlines() or [""]
     for i, line in enumerate(lines[:edit_h]):
         txt_win.addstr(i, 0, line[: edit_w - 1])
     txt_win.refresh()
     box = curses.textpad.Textbox(txt_win, insert_mode=True)
 
-    state = {"cancel": False, "execute": False, "tab": False}
+    state = {"cancel": False, "execute": False, "tab": None, "switch_tab": None, "new_tab": False}
 
     def validator(ch):
+        if ch == curses.KEY_DC:
+            return curses.KEY_BACKSPACE
+        if ch == 3:  # Ctrl+C
+            text = box.gather().rstrip()
+            if text:
+                set_clipboard_text(text)
+            return 0
+        if ch == 22:  # Ctrl+V
+            text = get_clipboard_text()
+            if text:
+                for c in text:
+                    if c == "\r":
+                        continue
+                    if c == "\n":
+                        box.do_command(curses.ascii.NL)
+                    else:
+                        box.do_command(ord(c))
+            return 0
+        if ch in (curses.KEY_HOME, 262):
+            return 1  # Ctrl+A
+        if ch in (curses.KEY_END, 360):
+            return 5  # Ctrl+E
+        if ch == curses.ascii.SO:  # Ctrl+N
+            state["new_tab"] = True
+            return 7
+        if ch in (curses.KEY_CTAB, 341):
+            state["switch_tab"] = "next"
+            return 7
+        if ch in (curses.KEY_CATAB, 342):
+            state["switch_tab"] = "prev"
+            return 7
         if ch == curses.KEY_F5:
             state["execute"] = True
             return 7
         if ch == curses.KEY_F2:
             state["execute"] = True
             return 7
-        if ch in (9, curses.KEY_BTAB):
-            state["tab"] = True
+        if ch == 9:
+            state["tab"] = "next"
+            return 7
+        if ch in (curses.KEY_BTAB, 353):
+            state["tab"] = "prev"
             return 7
         if ch == curses.KEY_F1:
             screen_help(stdscr)
@@ -899,13 +1029,21 @@ def editor_edit(stdscr, y, x, h, w, initial_sql):
     if state["cancel"]:
         return initial_sql, None
     sql = content.strip()
-    sql = normalize_editor_text(sql)
+    sql = normalize_editor_text(sql, initial_sql)
     if not sql:
-        return initial_sql, "tab" if state["tab"] else None
+        if state["new_tab"]:
+            return initial_sql, "new_tab"
+        if state["switch_tab"]:
+            return initial_sql, f"switch_tab_{state['switch_tab']}"
+        return initial_sql, f"tab_{state['tab']}" if state["tab"] else None
     if state["execute"]:
         return sql, "execute"
+    if state["new_tab"]:
+        return sql, "new_tab"
+    if state["switch_tab"]:
+        return sql, f"switch_tab_{state['switch_tab']}"
     if state["tab"]:
-        return sql, "tab"
+        return sql, f"tab_{state['tab']}"
     return sql, "edited"
 
 
@@ -917,53 +1055,73 @@ def screen_workspace(stdscr, conn, cfg, current):
     tables_cache = {}
     expanded_tables = set()
     columns_cache = {}
-    editor_text = ""
-    result_scroll = 0
-    result_scroll_x = 0
-    result_row_count = 0
-    result_col_count = 0
-    result_title = "Results"
-    result_cols = None
-    result_rows = None
-    result_msg = ""
-    result_error = ""
+    tabs = []
+    tab_index = 0
+    tab_seq = 1
     enter_edit_on_focus = False
+    def new_tab(initial_text=""):
+        nonlocal tab_seq, tab_index
+        title = f"SQLQuery_{tab_seq}"
+        tab_seq += 1
+        tabs.append(
+            {
+                "title": title,
+                "text": initial_text,
+                "result": {
+                    "scroll": 0,
+                    "scroll_x": 0,
+                    "row_count": 0,
+                    "col_count": 0,
+                    "title": "Results",
+                    "cols": None,
+                    "rows": None,
+                    "msg": "",
+                    "error": "",
+                },
+            }
+        )
+        tab_index = len(tabs) - 1
+
+    def current_tab():
+        return tabs[tab_index]
 
     def execute_and_set(sql):
-        nonlocal result_cols, result_rows, result_row_count, result_col_count, result_title
-        nonlocal result_msg, result_error, result_scroll, result_scroll_x, focus
+        nonlocal focus
+        res = current_tab()["result"]
         try:
             cols, rows, rowcount = run_query(conn, sql)
             if cols:
-                result_cols = cols
-                result_rows = rows
-                result_row_count = len(rows)
-                result_col_count = len(cols)
-                result_title = f"Results ({result_row_count} rows, {result_col_count} cols)"
-                result_msg = ""
-                result_error = ""
+                res["cols"] = cols
+                res["rows"] = rows
+                res["row_count"] = len(rows)
+                res["col_count"] = len(cols)
+                res["title"] = f"Results ({res['row_count']} rows, {res['col_count']} cols)"
+                res["msg"] = ""
+                res["error"] = ""
             else:
-                result_cols = None
-                result_rows = None
-                result_row_count = rowcount if rowcount is not None else 0
-                result_col_count = 0
-                result_title = "Results"
-                result_msg = f"OK. Linhas afetadas: {rowcount}"
-                result_error = ""
-            result_scroll = 0
-            result_scroll_x = 0
+                res["cols"] = None
+                res["rows"] = None
+                res["row_count"] = rowcount if rowcount is not None else 0
+                res["col_count"] = 0
+                res["title"] = "Results"
+                res["msg"] = f"OK. Linhas afetadas: {rowcount}"
+                res["error"] = ""
+            res["scroll"] = 0
+            res["scroll_x"] = 0
             focus = "results"
         except Exception as e:
-            result_cols = None
-            result_rows = None
-            result_title = "Erro"
-            result_row_count = 0
-            result_col_count = 0
-            result_msg = ""
-            result_error = str(e)
-            result_scroll = 0
-            result_scroll_x = 0
+            res["cols"] = None
+            res["rows"] = None
+            res["title"] = "Erro"
+            res["row_count"] = 0
+            res["col_count"] = 0
+            res["msg"] = ""
+            res["error"] = str(e)
+            res["scroll"] = 0
+            res["scroll_x"] = 0
             focus = "results"
+
+    new_tab("")
 
     try:
         try:
@@ -971,7 +1129,9 @@ def screen_workspace(stdscr, conn, cfg, current):
         except Exception:
             pass
         while True:
-            editor_text = normalize_editor_text(editor_text)
+            tab = current_tab()
+            tab["text"] = normalize_editor_text(tab["text"])
+            res = tab["result"]
             if not dbs:
                 try:
                     dbs = fetch_databases(conn)
@@ -1004,12 +1164,27 @@ def screen_workspace(stdscr, conn, cfg, current):
             result_h = max(4, content_h - editor_h - 1)
 
             if focus == "editor" and enter_edit_on_focus:
-                editor_text, action = editor_edit(stdscr, content_top, right_x, editor_h, right_w, editor_text)
+                new_text, action = editor_edit(stdscr, content_top, right_x, editor_h, right_w, tab["text"])
+                tab["text"] = new_text
                 enter_edit_on_focus = False
                 if action == "execute":
-                    execute_and_set(editor_text)
-                elif action == "tab":
+                    execute_and_set(tab["text"])
+                elif action == "tab_next":
                     focus = "results"
+                elif action == "tab_prev":
+                    focus = "tree"
+                elif action == "new_tab":
+                    new_tab("")
+                    focus = "editor"
+                    enter_edit_on_focus = True
+                elif action == "switch_tab_next":
+                    tab_index = (tab_index + 1) % len(tabs)
+                    focus = "editor"
+                    enter_edit_on_focus = True
+                elif action == "switch_tab_prev":
+                    tab_index = (tab_index - 1) % len(tabs)
+                    focus = "editor"
+                    enter_edit_on_focus = True
                 continue
 
             # left separator
@@ -1040,8 +1215,9 @@ def screen_workspace(stdscr, conn, cfg, current):
             # Editor panel (right top)
             editor_y = content_top
             editor_x = right_x
-            editor_win = panel_window(stdscr, editor_y, editor_x, editor_h, right_w, "SQLQuery_1", focused=(focus == "editor"))
-            editor_lines = editor_text.splitlines() or [""]
+            editor_title = f"{tab['title']} ({tab_index + 1}/{len(tabs)})"
+            editor_win = panel_window(stdscr, editor_y, editor_x, editor_h, right_w, editor_title, focused=(focus == "editor"))
+            editor_lines = tab["text"].splitlines() or [""]
             max_editor_lines = editor_h - 2
             for i, line in enumerate(editor_lines[:max_editor_lines]):
                 safe_addstr(editor_win, 1 + i, 2, line[: right_w - 4])
@@ -1050,35 +1226,35 @@ def screen_workspace(stdscr, conn, cfg, current):
 
             # Results panel (right bottom)
             result_y = editor_y + editor_h + 1
-            results_win = panel_window(stdscr, result_y, editor_x, result_h, right_w, result_title, focused=(focus == "results"))
+            results_win = panel_window(stdscr, result_y, editor_x, result_h, right_w, res["title"], focused=(focus == "results"))
             max_result_lines = result_h - 2
             avail_w = max(1, right_w - 4)
-            if result_error:
-                lines = result_error.splitlines() or [result_error]
+            if res["error"]:
+                lines = res["error"].splitlines() or [res["error"]]
                 for i, line in enumerate(lines[:max_result_lines]):
                     safe_addstr(results_win, 1 + i, 2, line[:avail_w])
-            elif result_cols is not None and result_rows is not None:
+            elif res["cols"] is not None and res["rows"] is not None:
                 max_data_rows = max(1, max_result_lines - 2)
-                max_scroll_y = max(0, result_row_count - max_data_rows)
-                result_scroll = max(0, min(result_scroll, max_scroll_y))
+                max_scroll_y = max(0, res["row_count"] - max_data_rows)
+                res["scroll"] = max(0, min(res["scroll"], max_scroll_y))
                 lines, total_width = format_table_view(
-                    result_cols, result_rows, result_scroll, max_data_rows
+                    res["cols"], res["rows"], res["scroll"], max_data_rows
                 )
                 max_scroll_x = max(0, total_width - avail_w)
-                result_scroll_x = max(0, min(result_scroll_x, max_scroll_x))
+                res["scroll_x"] = max(0, min(res["scroll_x"], max_scroll_x))
                 for i, line in enumerate(lines[:max_result_lines]):
-                    view = line[result_scroll_x : result_scroll_x + avail_w]
+                    view = line[res["scroll_x"] : res["scroll_x"] + avail_w]
                     safe_addstr(results_win, 1 + i, 2, view)
-            elif result_msg:
-                safe_addstr(results_win, 1, 2, result_msg[:avail_w])
+            elif res["msg"]:
+                safe_addstr(results_win, 1, 2, res["msg"][:avail_w])
             else:
                 safe_addstr(results_win, 1, 2, "Sem resultados.")
             if focus == "results":
-                info = f"Setas=Scroll | <-/->=Colunas | F6=Salvar CSV | Rows={result_row_count} Cols={result_col_count}"
+                info = f"Setas=Scroll | <-/->=Colunas | F6=Salvar CSV | Rows={res['row_count']} Cols={res['col_count']}"
                 safe_addstr(results_win, result_h - 2, 2, info[: right_w - 4])
 
             # Footer
-            footer = "ESC = Desconectar | R = Atualizar | TAB = Alternar foco (editor abre) | F6 = Salvar CSV | F1 = Ajuda"
+            footer = "ESC = Desconectar | R = Atualizar | TAB = Alternar foco | Shift+TAB = Foco anterior | Ctrl+N = Nova query | Ctrl+TAB = Trocar query | F6 = Salvar CSV | F1 = Ajuda"
             safe_addstr(stdscr, h - 1, 2, footer[: w - 4])
 
             stdscr.refresh()
@@ -1093,7 +1269,7 @@ def screen_workspace(stdscr, conn, cfg, current):
             if ch in (27,):
                 return "disconnect"
             if ch == curses.KEY_F6:
-                if result_cols and result_rows is not None:
+                if res["cols"] is not None and res["rows"] is not None:
                     default_path = default_csv_path()
                     try:
                         curses.endwin()
@@ -1102,20 +1278,41 @@ def screen_workspace(stdscr, conn, cfg, current):
                     path = choose_save_path(default_path) or prompt_input(stdscr, "Salvar CSV em:", default_path)
                     if path:
                         try:
-                            export_csv(path, result_cols, result_rows)
+                            export_csv(path, res["cols"], res["rows"])
                             panel_message(stdscr, result_y, editor_x, result_h, right_w, "Download CSV", f"Salvo em:\n{path}")
                         except Exception as e:
                             panel_message(stdscr, result_y, editor_x, result_h, right_w, "Erro", str(e))
                 else:
                     panel_message(stdscr, result_y, editor_x, result_h, right_w, "Download CSV", "Nenhum resultado para exportar.")
                 continue
-            if ch in (9,):  # TAB
-                if focus == "tree":
-                    focus = "editor"
-                elif focus == "editor":
-                    focus = "results"
+            if ch == curses.ascii.SO:  # Ctrl+N
+                new_tab("")
+                focus = "editor"
+                enter_edit_on_focus = True
+                continue
+            if ch in (curses.KEY_CTAB, 341):
+                tab_index = (tab_index + 1) % len(tabs)
+                focus = "editor"
+                continue
+            if ch in (curses.KEY_CATAB, 342):
+                tab_index = (tab_index - 1) % len(tabs)
+                focus = "editor"
+                continue
+            if ch in (9, curses.KEY_BTAB, 353):  # TAB / Shift+TAB
+                if ch == 9:
+                    if focus == "tree":
+                        focus = "editor"
+                    elif focus == "editor":
+                        focus = "results"
+                    else:
+                        focus = "tree"
                 else:
-                    focus = "tree"
+                    if focus == "tree":
+                        focus = "results"
+                    elif focus == "editor":
+                        focus = "tree"
+                    else:
+                        focus = "editor"
                 continue
             if ch == curses.KEY_MOUSE:
                 try:
@@ -1145,9 +1342,9 @@ def screen_workspace(stdscr, conn, cfg, current):
                     focus = "results"
                     # scroll wheel in results
                     if bstate & getattr(curses, "BUTTON4_PRESSED", 0):
-                        result_scroll = max(0, result_scroll - 3)
+                        res["scroll"] = max(0, res["scroll"] - 3)
                     if bstate & getattr(curses, "BUTTON5_PRESSED", 0):
-                        result_scroll = min(max(0, result_row_count - 1), result_scroll + 3)
+                        res["scroll"] = min(max(0, res["row_count"] - 1), res["scroll"] + 3)
                     continue
             if ch in (ord("r"), ord("R")):
                 dbs = []
@@ -1229,7 +1426,7 @@ def screen_workspace(stdscr, conn, cfg, current):
                             except Exception as e:
                                 panel_message(stdscr, content_top, right_x, content_h, right_w, "Erro", str(e))
                                 continue
-                        editor_text = f"SELECT TOP 100 * FROM {build_table_ref(schema, table)}"
+                        tab["text"] = f"SELECT TOP 100 * FROM {build_table_ref(schema, table)}"
                     continue
 
                 if item["type"] == "table" and ch in (ord("s"), ord("S"), ord("i"), ord("I"), ord("u"), ord("U"), ord("d"), ord("D")):
@@ -1247,42 +1444,57 @@ def screen_workspace(stdscr, conn, cfg, current):
                             panel_message(stdscr, content_top, right_x, content_h, right_w, "Erro", str(e))
                             continue
                     if ch in (ord("s"), ord("S")):
-                        editor_text = f"SELECT TOP 100 * FROM {build_table_ref(schema, table)}"
+                        tab["text"] = f"SELECT TOP 100 * FROM {build_table_ref(schema, table)}"
                     elif ch in (ord("i"), ord("I")):
-                        editor_text = f"INSERT INTO {build_table_ref(schema, table)} (col1, col2) VALUES (val1, val2)"
+                        tab["text"] = f"INSERT INTO {build_table_ref(schema, table)} (col1, col2) VALUES (val1, val2)"
                     elif ch in (ord("u"), ord("U")):
-                        editor_text = f"UPDATE {build_table_ref(schema, table)} SET col1 = val1 WHERE condicao"
+                        tab["text"] = f"UPDATE {build_table_ref(schema, table)} SET col1 = val1 WHERE condicao"
                     else:
-                        editor_text = f"DELETE FROM {build_table_ref(schema, table)} WHERE condicao"
+                        tab["text"] = f"DELETE FROM {build_table_ref(schema, table)} WHERE condicao"
                     continue
 
             elif focus == "editor":
                 if ch in (curses.KEY_ENTER, 10, 13):
-                    editor_text, action = editor_edit(stdscr, editor_y, editor_x, editor_h, right_w, editor_text)
+                    new_text, action = editor_edit(stdscr, editor_y, editor_x, editor_h, right_w, tab["text"])
+                    tab["text"] = new_text
                     if action == "execute":
-                        execute_and_set(editor_text)
-                    elif action == "tab":
+                        execute_and_set(tab["text"])
+                    elif action == "tab_next":
                         focus = "results"
+                    elif action == "tab_prev":
+                        focus = "tree"
+                    elif action == "new_tab":
+                        new_tab("")
+                        focus = "editor"
+                        enter_edit_on_focus = True
+                    elif action == "switch_tab_next":
+                        tab_index = (tab_index + 1) % len(tabs)
+                        focus = "editor"
+                        enter_edit_on_focus = True
+                    elif action == "switch_tab_prev":
+                        tab_index = (tab_index - 1) % len(tabs)
+                        focus = "editor"
+                        enter_edit_on_focus = True
                     continue
                 if ch in (curses.KEY_F5, curses.KEY_F2):
-                    if editor_text.strip():
-                        execute_and_set(editor_text)
+                    if tab["text"].strip():
+                        execute_and_set(tab["text"])
                     continue
 
             elif focus == "results":
                 if ch in (curses.KEY_UP,):
-                    result_scroll = max(0, result_scroll - 1)
+                    res["scroll"] = max(0, res["scroll"] - 1)
                 elif ch in (curses.KEY_DOWN,):
-                    if result_rows:
-                        result_scroll = min(max(0, result_row_count - 1), result_scroll + 1)
+                    if res["rows"]:
+                        res["scroll"] = min(max(0, res["row_count"] - 1), res["scroll"] + 1)
                 elif ch in (curses.KEY_LEFT,):
-                    result_scroll_x = max(0, result_scroll_x - 3)
+                    res["scroll_x"] = max(0, res["scroll_x"] - 3)
                 elif ch in (curses.KEY_RIGHT,):
-                    result_scroll_x = result_scroll_x + 3
+                    res["scroll_x"] = res["scroll_x"] + 3
                 elif ch in (curses.KEY_NPAGE,):
-                    result_scroll = min(max(0, result_row_count - 1), result_scroll + max(1, result_h - 3))
+                    res["scroll"] = min(max(0, res["row_count"] - 1), res["scroll"] + max(1, result_h - 3))
                 elif ch in (curses.KEY_PPAGE,):
-                    result_scroll = max(0, result_scroll - max(1, result_h - 3))
+                    res["scroll"] = max(0, res["scroll"] - max(1, result_h - 3))
                 continue
     except Exception:
         log_event("CRASH_WORKSPACE\n" + traceback.format_exc())
@@ -1428,6 +1640,7 @@ def screen_query(stdscr, conn, initial_sql=""):
     edit_win = curses.newwin(edit_h, edit_w, 4, 2)
     edit_win.border()
     txt_win = curses.newwin(edit_h - 2, edit_w - 2, 5, 3)
+    safe_keypad(txt_win, True)
     txt_win.addstr(0, 0, initial_sql)
     txt_win.refresh()
     box = curses.textpad.Textbox(txt_win, insert_mode=True)
@@ -1435,6 +1648,28 @@ def screen_query(stdscr, conn, initial_sql=""):
     state = {"cancel": False}
 
     def validator(ch):
+        if ch == curses.KEY_DC:
+            return curses.KEY_BACKSPACE
+        if ch == 3:  # Ctrl+C
+            text = box.gather().rstrip()
+            if text:
+                set_clipboard_text(text)
+            return 0
+        if ch == 22:  # Ctrl+V
+            text = get_clipboard_text()
+            if text:
+                for c in text:
+                    if c == "\r":
+                        continue
+                    if c == "\n":
+                        box.do_command(curses.ascii.NL)
+                    else:
+                        box.do_command(ord(c))
+            return 0
+        if ch in (curses.KEY_HOME, 262):
+            return 1  # Ctrl+A
+        if ch in (curses.KEY_END, 360):
+            return 5  # Ctrl+E
         if ch == curses.KEY_F2:
             return 7  # Ctrl+G para finalizar
         if ch == curses.KEY_F1:
@@ -1474,6 +1709,8 @@ def app(stdscr):
     safe_curs_set(0)
     safe_start_color()
     safe_use_default_colors()
+    safe_keypad(stdscr, True)
+    safe_raw()
     global FOCUS_ATTR
     try:
         if curses.has_colors():
@@ -1481,64 +1718,67 @@ def app(stdscr):
             FOCUS_ATTR = curses.color_pair(1)
     except curses.error:
         FOCUS_ATTR = 0
-    screen_splash(stdscr)
-    cfg = load_config()
-    current = {
-        "name": "",
-        "host": "",
-        "port": cfg.get("port", "1433") or "1433",
-        "user": "",
-        "database": "master",
-        "driver": cfg.get("driver", "ODBC Driver 18 for SQL Server"),
-    }
-    password = ""
-    while True:
-        cfg, current, password = screen_connect(stdscr, cfg, current, password)
-        if cfg is None:
-            return
-        stdscr.clear()
-        draw_header(stdscr, f"Jupyter-SSMS {VERSION} - Conectando...")
-        stdscr.refresh()
-        conn_cfg = dict(cfg)
-        conn_cfg.update(current)
-        conn, err = connect_db(conn_cfg, password)
-        if err:
-            screen_message(stdscr, "Erro", err)
-            continue
-        # Persistir configuracoes nao sensiveis
-        cfg["port"] = current.get("port", cfg.get("port", "1433"))
-        cfg["driver"] = current.get("driver", cfg.get("driver", "ODBC Driver 18 for SQL Server"))
-        save_config(cfg)
-
-        if cfg.get("remember"):
-            entry = {
-                "name": current.get("name", ""),
-                "host": current.get("host", ""),
-                "port": current.get("port", "1433"),
-                "user": current.get("user", ""),
-                "database": current.get("database", "master"),
-                "driver": current.get("driver", cfg.get("driver", "")),
-                "encrypt": bool(cfg.get("encrypt", True)),
-                "trust_server_certificate": bool(cfg.get("trust_server_certificate", True)),
-            }
-            if cfg.get("save_password") and password:
-                entry["password"] = password
-            upsert_history(cfg, entry)
-
+    try:
+        screen_splash(stdscr)
+        cfg = load_config()
+        current = {
+            "name": "",
+            "host": "",
+            "port": cfg.get("port", "1433") or "1433",
+            "user": "",
+            "database": "master",
+            "driver": cfg.get("driver", "ODBC Driver 18 for SQL Server"),
+        }
+        password = ""
         while True:
-            action = screen_workspace(stdscr, conn, cfg, current)
-            if action == "disconnect":
-                try:
-                    conn.close()
-                except Exception:
-                    pass
-                break
-            if action == "exit":
-                try:
-                    conn.close()
-                except Exception:
-                    pass
+            cfg, current, password = screen_connect(stdscr, cfg, current, password)
+            if cfg is None:
                 return
+            stdscr.clear()
+            draw_header(stdscr, f"Jupyter-SSMS {VERSION} - Conectando...")
+            stdscr.refresh()
+            conn_cfg = dict(cfg)
+            conn_cfg.update(current)
+            conn, err = connect_db(conn_cfg, password)
+            if err:
+                screen_message(stdscr, "Erro", err)
+                continue
+            # Persistir configuracoes nao sensiveis
+            cfg["port"] = current.get("port", cfg.get("port", "1433"))
+            cfg["driver"] = current.get("driver", cfg.get("driver", "ODBC Driver 18 for SQL Server"))
+            save_config(cfg)
+
+            if cfg.get("remember"):
+                entry = {
+                    "name": current.get("name", ""),
+                    "host": current.get("host", ""),
+                    "port": current.get("port", "1433"),
+                    "user": current.get("user", ""),
+                    "database": current.get("database", "master"),
+                    "driver": current.get("driver", cfg.get("driver", "")),
+                    "encrypt": bool(cfg.get("encrypt", True)),
+                    "trust_server_certificate": bool(cfg.get("trust_server_certificate", True)),
+                }
+                if cfg.get("save_password") and password:
+                    entry["password"] = password
+                upsert_history(cfg, entry)
+
+            while True:
+                action = screen_workspace(stdscr, conn, cfg, current)
+                if action == "disconnect":
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+                    break
+                if action == "exit":
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+                    return
+    finally:
+        safe_noraw()
 
 
 if __name__ == "__main__":
