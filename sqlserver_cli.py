@@ -20,7 +20,8 @@ CONFIG_DIR = os.path.join(os.path.expanduser("~"), ".config", "jupyter-ssms")
 LOG_DIR = os.path.join(os.path.expanduser("~"), ".local", "share", "jupyter-ssms")
 CONFIG_PATH = os.path.join(CONFIG_DIR, "config.json")
 LOG_PATH = os.path.join(LOG_DIR, "jupyter_ssms.log")
-VERSION = "Io v1.06022026"
+VERSION = "Io v2.06022026"
+FOCUS_ATTR = 0
 
 DEFAULT_CONFIG = {
     "host": "",
@@ -97,6 +98,12 @@ def safe_curs_set(value):
 def safe_use_default_colors():
     try:
         curses.use_default_colors()
+    except curses.error:
+        pass
+
+def safe_start_color():
+    try:
+        curses.start_color()
     except curses.error:
         pass
 
@@ -281,6 +288,14 @@ def format_table_view(cols, rows, start_row, max_rows, max_cell=60, sample=200):
         lines.append(line)
     total_width = len(header)
     return lines, total_width
+
+
+def normalize_editor_text(text):
+    lines = [l.rstrip() for l in text.splitlines()]
+    non_empty = [l for l in lines if l.strip()]
+    if len(non_empty) >= 2 and all(l == non_empty[0] for l in non_empty):
+        return non_empty[0]
+    return text
 
 
 def default_csv_path():
@@ -680,11 +695,17 @@ def screen_connect(stdscr, cfg, current, password):
             continue
 
 
-def panel_window(stdscr, y, x, h, w, title):
+def panel_window(stdscr, y, x, h, w, title, focused=False):
     win = curses.newwin(h, w, y, x)
     win.clear()
-    win.border()
-    safe_addstr(win, 0, 2, f" {title} ")
+    if focused and FOCUS_ATTR:
+        win.attron(FOCUS_ATTR)
+        win.border()
+        win.attroff(FOCUS_ATTR)
+        safe_addstr(win, 0, 2, f" {title} ", FOCUS_ATTR)
+    else:
+        win.border()
+        safe_addstr(win, 0, 2, f" {title} ")
     return win
 
 
@@ -848,7 +869,7 @@ def editor_edit(stdscr, y, x, h, w, initial_sql):
     txt_win.refresh()
     box = curses.textpad.Textbox(txt_win, insert_mode=True)
 
-    state = {"cancel": False, "execute": False}
+    state = {"cancel": False, "execute": False, "tab": False}
 
     def validator(ch):
         if ch == curses.KEY_F5:
@@ -856,6 +877,9 @@ def editor_edit(stdscr, y, x, h, w, initial_sql):
             return 7
         if ch == curses.KEY_F2:
             state["execute"] = True
+            return 7
+        if ch in (9, curses.KEY_BTAB):
+            state["tab"] = True
             return 7
         if ch == curses.KEY_F1:
             screen_help(stdscr)
@@ -875,10 +899,13 @@ def editor_edit(stdscr, y, x, h, w, initial_sql):
     if state["cancel"]:
         return initial_sql, None
     sql = content.strip()
+    sql = normalize_editor_text(sql)
     if not sql:
-        return initial_sql, None
+        return initial_sql, "tab" if state["tab"] else None
     if state["execute"]:
         return sql, "execute"
+    if state["tab"]:
+        return sql, "tab"
     return sql, "edited"
 
 
@@ -902,12 +929,49 @@ def screen_workspace(stdscr, conn, cfg, current):
     result_error = ""
     enter_edit_on_focus = False
 
+    def execute_and_set(sql):
+        nonlocal result_cols, result_rows, result_row_count, result_col_count, result_title
+        nonlocal result_msg, result_error, result_scroll, result_scroll_x, focus
+        try:
+            cols, rows, rowcount = run_query(conn, sql)
+            if cols:
+                result_cols = cols
+                result_rows = rows
+                result_row_count = len(rows)
+                result_col_count = len(cols)
+                result_title = f"Results ({result_row_count} rows, {result_col_count} cols)"
+                result_msg = ""
+                result_error = ""
+            else:
+                result_cols = None
+                result_rows = None
+                result_row_count = rowcount if rowcount is not None else 0
+                result_col_count = 0
+                result_title = "Results"
+                result_msg = f"OK. Linhas afetadas: {rowcount}"
+                result_error = ""
+            result_scroll = 0
+            result_scroll_x = 0
+            focus = "results"
+        except Exception as e:
+            result_cols = None
+            result_rows = None
+            result_title = "Erro"
+            result_row_count = 0
+            result_col_count = 0
+            result_msg = ""
+            result_error = str(e)
+            result_scroll = 0
+            result_scroll_x = 0
+            focus = "results"
+
     try:
         try:
             curses.mousemask(curses.ALL_MOUSE_EVENTS | curses.REPORT_MOUSE_POSITION)
         except Exception:
             pass
         while True:
+            editor_text = normalize_editor_text(editor_text)
             if not dbs:
                 try:
                     dbs = fetch_databases(conn)
@@ -943,19 +1007,9 @@ def screen_workspace(stdscr, conn, cfg, current):
                 editor_text, action = editor_edit(stdscr, content_top, right_x, editor_h, right_w, editor_text)
                 enter_edit_on_focus = False
                 if action == "execute":
-                    try:
-                        cols, rows, rowcount = run_query(conn, editor_text)
-                        if cols:
-                            result_lines = format_table(cols, rows, right_w - 4, result_h - 2)
-                            result_title = "Results"
-                        else:
-                            result_lines = [f"OK. Linhas afetadas: {rowcount}"]
-                            result_title = "Results"
-                        result_scroll = 0
-                    except Exception as e:
-                        result_lines = [str(e)]
-                        result_title = "Erro"
-                        result_scroll = 0
+                    execute_and_set(editor_text)
+                elif action == "tab":
+                    focus = "results"
                 continue
 
             # left separator
@@ -963,7 +1017,7 @@ def screen_workspace(stdscr, conn, cfg, current):
                 safe_addstr(stdscr, y, left_w, "|")
 
             # Tree panel (left)
-            tree_win = panel_window(stdscr, content_top, 1, content_h, left_w, "Connections")
+            tree_win = panel_window(stdscr, content_top, 1, content_h, left_w, "Connections", focused=(focus == "tree"))
             tree_items = build_tree_items(dbs, expanded_dbs, tables_cache, expanded_tables, columns_cache)
             if tree_idx >= len(tree_items):
                 tree_idx = max(0, len(tree_items) - 1)
@@ -986,7 +1040,7 @@ def screen_workspace(stdscr, conn, cfg, current):
             # Editor panel (right top)
             editor_y = content_top
             editor_x = right_x
-            editor_win = panel_window(stdscr, editor_y, editor_x, editor_h, right_w, "SQLQuery_1")
+            editor_win = panel_window(stdscr, editor_y, editor_x, editor_h, right_w, "SQLQuery_1", focused=(focus == "editor"))
             editor_lines = editor_text.splitlines() or [""]
             max_editor_lines = editor_h - 2
             for i, line in enumerate(editor_lines[:max_editor_lines]):
@@ -996,7 +1050,7 @@ def screen_workspace(stdscr, conn, cfg, current):
 
             # Results panel (right bottom)
             result_y = editor_y + editor_h + 1
-            results_win = panel_window(stdscr, result_y, editor_x, result_h, right_w, result_title)
+            results_win = panel_window(stdscr, result_y, editor_x, result_h, right_w, result_title, focused=(focus == "results"))
             max_result_lines = result_h - 2
             avail_w = max(1, right_w - 4)
             if result_error:
@@ -1058,7 +1112,6 @@ def screen_workspace(stdscr, conn, cfg, current):
             if ch in (9,):  # TAB
                 if focus == "tree":
                     focus = "editor"
-                    enter_edit_on_focus = True
                 elif focus == "editor":
                     focus = "results"
                 else:
@@ -1066,7 +1119,7 @@ def screen_workspace(stdscr, conn, cfg, current):
                 continue
             if ch == curses.KEY_MOUSE:
                 try:
-                    _, mx, my, _, _ = curses.getmouse()
+                    _, mx, my, _, bstate = curses.getmouse()
                 except Exception:
                     continue
                 # click in tree panel
@@ -1090,6 +1143,11 @@ def screen_workspace(stdscr, conn, cfg, current):
                 # click in results panel
                 if result_y <= my < result_y + result_h and editor_x <= mx < editor_x + right_w:
                     focus = "results"
+                    # scroll wheel in results
+                    if bstate & getattr(curses, "BUTTON4_PRESSED", 0):
+                        result_scroll = max(0, result_scroll - 3)
+                    if bstate & getattr(curses, "BUTTON5_PRESSED", 0):
+                        result_scroll = min(max(0, result_row_count - 1), result_scroll + 3)
                     continue
             if ch in (ord("r"), ord("R")):
                 dbs = []
@@ -1202,73 +1260,13 @@ def screen_workspace(stdscr, conn, cfg, current):
                 if ch in (curses.KEY_ENTER, 10, 13):
                     editor_text, action = editor_edit(stdscr, editor_y, editor_x, editor_h, right_w, editor_text)
                     if action == "execute":
-                        try:
-                            cols, rows, rowcount = run_query(conn, editor_text)
-                            if cols:
-                                result_cols = cols
-                                result_rows = rows
-                                result_row_count = len(rows)
-                                result_col_count = len(cols)
-                                result_title = f"Results ({result_row_count} rows, {result_col_count} cols)"
-                                result_msg = ""
-                                result_error = ""
-                            else:
-                                result_cols = None
-                                result_rows = None
-                                result_row_count = rowcount if rowcount is not None else 0
-                                result_col_count = 0
-                                result_title = "Results"
-                                result_msg = f"OK. Linhas afetadas: {rowcount}"
-                                result_error = ""
-                            result_scroll = 0
-                            result_scroll_x = 0
-                            focus = "results"
-                        except Exception as e:
-                            result_cols = None
-                            result_rows = None
-                            result_title = "Erro"
-                            result_row_count = 0
-                            result_col_count = 0
-                            result_msg = ""
-                            result_error = str(e)
-                            result_scroll = 0
-                            result_scroll_x = 0
-                            focus = "results"
+                        execute_and_set(editor_text)
+                    elif action == "tab":
+                        focus = "results"
                     continue
                 if ch in (curses.KEY_F5, curses.KEY_F2):
                     if editor_text.strip():
-                        try:
-                            cols, rows, rowcount = run_query(conn, editor_text)
-                            if cols:
-                                result_cols = cols
-                                result_rows = rows
-                                result_row_count = len(rows)
-                                result_col_count = len(cols)
-                                result_title = f"Results ({result_row_count} rows, {result_col_count} cols)"
-                                result_msg = ""
-                                result_error = ""
-                            else:
-                                result_cols = None
-                                result_rows = None
-                                result_row_count = rowcount if rowcount is not None else 0
-                                result_col_count = 0
-                                result_title = "Results"
-                                result_msg = f"OK. Linhas afetadas: {rowcount}"
-                                result_error = ""
-                            result_scroll = 0
-                            result_scroll_x = 0
-                            focus = "results"
-                        except Exception as e:
-                            result_cols = None
-                            result_rows = None
-                            result_title = "Erro"
-                            result_row_count = 0
-                            result_col_count = 0
-                            result_msg = ""
-                            result_error = str(e)
-                            result_scroll = 0
-                            result_scroll_x = 0
-                            focus = "results"
+                        execute_and_set(editor_text)
                     continue
 
             elif focus == "results":
@@ -1474,7 +1472,15 @@ def screen_query(stdscr, conn, initial_sql=""):
 
 def app(stdscr):
     safe_curs_set(0)
+    safe_start_color()
     safe_use_default_colors()
+    global FOCUS_ATTR
+    try:
+        if curses.has_colors():
+            curses.init_pair(1, curses.COLOR_BLUE, -1)
+            FOCUS_ATTR = curses.color_pair(1)
+    except curses.error:
+        FOCUS_ATTR = 0
     screen_splash(stdscr)
     cfg = load_config()
     current = {
